@@ -1,0 +1,46 @@
+[project]
+name = "respan-redteam"
+version = "0.1.0"
+description = "Adaptive red-team engine and CLI for AI agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Respan" }]
+keywords = ["llm", "red-team", "security", "ai-safety", "owasp", "jailbreak", "agent"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "openai>=1.40",
+    "python-dotenv>=1.0.1",
+    "websockets>=13",          # remote-adapter bridge: the CLI's WebSocket client
+    "rich>=13",                # CLI progress stream + graded report rendering
+]
+
+[project.urls]
+Homepage = "https://github.com/respanai/respan-redteam"
+Documentation = "https://github.com/respanai/respan-redteam#readme"
+Repository = "https://github.com/respanai/respan-redteam"
+Issues = "https://github.com/respanai/respan-redteam/issues"
+
+[project.scripts]
+respan-redteam = "respan_redteam.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["respan_redteam"]
