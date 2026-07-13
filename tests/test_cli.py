@@ -8,11 +8,11 @@ import io
 import os
 import tempfile
 from contextlib import redirect_stderr
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
-from respan_redteam.cli import (_Progress, _campaign_url, _error, _explain, _load_adapter,
+from respan_redteam.cli import (_Progress, _campaign_url, _connect, _error, _explain, _load_adapter,
                                 _open_adapter, _required, _retryable_connection_error,
                                 _write_report)
 
@@ -191,6 +191,27 @@ def test_adapter_open_retries_network_failure():
         progress = _Progress(quiet=True)
         with patch("respan_redteam.cli.asyncio.sleep", return_value=None):
             assert await _open_adapter(Target(), 2, 1, progress) == "chat"
+
+    asyncio.run(run())
+
+
+def test_remote_connection_sends_bearer_api_key():
+    async def run():
+        connection = object()
+        connect = AsyncMock(return_value=connection)
+        with patch("websockets.connect", connect):
+            result = await _connect(
+                "wss://redteam.respan.ai/redteam/remote/",
+                "secret-key",
+                1,
+                1,
+                _Progress(quiet=True),
+            )
+        assert result is connection
+        headers = connect.await_args.kwargs.get("additional_headers")
+        if headers is None:
+            headers = connect.await_args.kwargs["extra_headers"]
+        assert headers == {"Authorization": "Bearer secret-key"}
 
     asyncio.run(run())
 

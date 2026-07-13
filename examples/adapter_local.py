@@ -3,6 +3,7 @@
 Run a remote scan with:
 
     python -m respan_redteam --adapter examples/adapter_local.py \
+        --api-key "$RESPAN_API_KEY" \
         --ws-url ws://127.0.0.1:8000/redteam/remote/
 
 An adapter exposes `.open() -> Chat`; the chat implements `.send(user_message) -> str` and

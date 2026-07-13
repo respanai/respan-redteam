@@ -9,6 +9,7 @@ The backend owns history. The adapter creates a conversation and posts user turn
 Replace `_Backend` with calls to your service. Run:
 
     python -m respan_redteam --adapter examples/adapter_session.py \
+        --api-key "$RESPAN_API_KEY" \
         --ws-url ws://127.0.0.1:8000/redteam/remote/
 """
 from __future__ import annotations

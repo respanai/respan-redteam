@@ -55,8 +55,11 @@ and a
 The default remote scan uses Respan's hosted engine:
 
 ```bash
+export RESPAN_API_KEY=...
 respan-redteam adapter.py -o report.json
 ```
+
+Remote scans require a Respan API key. You can alternatively pass it with `--api-key`.
 
 To run the engine locally, provide an OpenAI-compatible API key:
 

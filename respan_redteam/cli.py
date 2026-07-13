@@ -42,6 +42,9 @@ from . import DEFAULT_BUDGET, run_campaign
 DEFAULT_WS_URL = os.environ.get(
     "RESPAN_REDTEAM_WS_URL", "wss://redteam.respan.ai/redteam/remote/",
 )
+DEFAULT_API_KEY = os.environ.get("RESPAN_API_KEY") or os.environ.get(
+    "RESPAN_REDTEAM_API_KEY"
+)
 
 try:
     from importlib.metadata import version
@@ -242,16 +245,33 @@ def _retryable_connection_error(exc: BaseException) -> bool:
     return isinstance(exc, (OSError, asyncio.TimeoutError, we.WebSocketException))
 
 
-async def _connect(ws_url: str, retries: int, timeout: float, prog: _Progress):
+async def _connect(
+    ws_url: str,
+    api_key: str,
+    retries: int,
+    timeout: float,
+    prog: _Progress,
+):
     """Open the WebSocket with bounded exponential backoff. Raises the last error if exhausted."""
     import websockets
     from websockets.exceptions import WebSocketException
     delay, last = 1.0, None
     attempts = max(1, retries)
+    header_argument = (
+        "additional_headers"
+        if int(websockets.__version__.split(".", maxsplit=1)[0]) >= 14
+        else "extra_headers"
+    )
     for attempt in range(1, attempts + 1):
         try:
-            return await websockets.connect(ws_url, open_timeout=timeout,
-                                            ping_interval=20, ping_timeout=60, max_size=None)
+            return await websockets.connect(
+                ws_url,
+                open_timeout=timeout,
+                ping_interval=20,
+                ping_timeout=60,
+                max_size=None,
+                **{header_argument: {"Authorization": f"Bearer {api_key}"}},
+            )
         except (OSError, WebSocketException, asyncio.TimeoutError) as exc:
             last = exc
             if not _retryable_connection_error(exc):
@@ -313,13 +333,13 @@ def _write_report(report: dict, output_format: str, output: str | None = None) -
             stream.close()
 
 
-async def _run_remote(ws_url: str, target, output_format: str, output: str | None,
+async def _run_remote(ws_url: str, api_key: str, target, output_format: str, output: str | None,
                       retries: int, connect_timeout: float, adapter_timeout: float,
                       adapter_retries: int, prog: _Progress,
                       fail_under: str | None = None) -> int:
     import websockets
 
-    ws = await _connect(ws_url, retries, connect_timeout, prog)
+    ws = await _connect(ws_url, api_key, retries, connect_timeout, prog)
     report, status, chats = None, "?", {}
     done_msg: dict = {}
     try:
@@ -488,6 +508,12 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
                            "adapter over a WebSocket.")
     mode.add_argument("--ws-url", dest="ws_url", default=DEFAULT_WS_URL, metavar="URL",
                       help=f"remote-scan engine WebSocket URL (default: {DEFAULT_WS_URL})")
+    mode.add_argument(
+        "--api-key",
+        default=DEFAULT_API_KEY,
+        metavar="KEY",
+        help="Respan API key for remote scans (default: RESPAN_API_KEY)",
+    )
     mode.add_argument("--retries", type=int, default=3, metavar="N",
                       help="remote connection attempts with backoff; must be >= 1 (default: 3)")
     mode.add_argument("--connect-timeout", type=float, default=15, metavar="SECONDS",
@@ -521,6 +547,8 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
         parser.error("--retries and --adapter-retries must be at least 1")
     if args.connect_timeout <= 0 or args.adapter_timeout <= 0:
         parser.error("timeouts must be greater than zero")
+    if not args.local and not args.api_key:
+        parser.error("remote scans require --api-key or RESPAN_API_KEY")
     if args.json:
         if args.format is not None:
             parser.error("use either --json or --format, not both")
@@ -543,7 +571,7 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
         prog.note(f"remote scan · {getattr(target, 'label', 'target')} → {args.ws_url}")
         try:
             return asyncio.run(_run_remote(
-                args.ws_url, target, args.format, args.output, args.retries,
+                args.ws_url, args.api_key, target, args.format, args.output, args.retries,
                 args.connect_timeout, args.adapter_timeout, args.adapter_retries,
                 prog, args.fail_under,
             ))
