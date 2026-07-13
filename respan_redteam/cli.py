@@ -3,6 +3,7 @@
     python -m respan_redteam --adapter ./adapter.py                 # remote scan (engine on redteam.respan.ai)
     python -m respan_redteam --adapter ./adapter.py --local         # run the engine on this machine
     python -m respan_redteam --adapter ./adapter.py --json > report.json
+    python -m respan_redteam auth login                              # save a Respan API key
 
 Point the engine at YOUR OWN agent via an adapter.py — a Target with `open() -> Chat` and
 `chat.send(user_msg) -> str` (see target.py). A scan runs one of two ways:
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import importlib.util
 import inspect
 import json
@@ -38,19 +40,22 @@ from rich.table import Table
 from rich.text import Text
 
 from . import DEFAULT_BUDGET, run_campaign
+from .credentials import (
+    CredentialStoreUnavailable,
+    delete_api_key,
+    load_stored_api_key,
+    resolve_api_key,
+    save_api_key,
+)
 
 DEFAULT_WS_URL = os.environ.get(
     "RESPAN_REDTEAM_WS_URL", "wss://redteam.respan.ai/redteam/remote/",
 )
-DEFAULT_API_KEY = os.environ.get("RESPAN_API_KEY") or os.environ.get(
-    "RESPAN_REDTEAM_API_KEY"
-)
-
 try:
     from importlib.metadata import version
     __version__ = version("respan-redteam")
 except Exception:  # package metadata is optional in a source checkout
-    __version__ = "0.1.0"
+    __version__ = "0.1.1"
 
 # rich styles (rich itself handles terminal detection, NO_COLOR, and FORCE_COLOR).
 _GRADE_STYLE = {"A": "bold green", "B": "green", "C": "bold yellow",
@@ -208,8 +213,10 @@ def _explain(exc: BaseException) -> str:
     """Human-readable one-liner for a connection failure (no traceback)."""
     import websockets.exceptions as we
     if isinstance(exc, we.InvalidStatus):
-        return f"server rejected the WebSocket (HTTP {getattr(exc.response, 'status_code', '?')}) " \
-               "— check the --ws-url path"
+        status = getattr(exc.response, "status_code", "?")
+        if status in (401, 403):
+            return f"authentication failed (HTTP {status}) — run `respan-redteam auth login`"
+        return f"server rejected the WebSocket (HTTP {status}) — check the --ws-url path"
     if isinstance(exc, we.InvalidURI):
         return "malformed --ws-url"
     if isinstance(exc, ConnectionRefusedError):
@@ -479,12 +486,90 @@ def _print_report(r: dict, console: Console) -> None:
             console.print(Text(f"    “{f['evidence_span'][:120]}”", style="dim"), soft_wrap=True)
 
 
+async def _validate_api_key(ws_url: str, api_key: str) -> None:
+    connection = await _connect(
+        ws_url,
+        api_key,
+        retries=1,
+        timeout=15,
+        prog=_Progress(quiet=True),
+    )
+    await connection.close()
+
+
+def _auth_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="respan-redteam auth",
+        description="Manage the Respan API key in your system credential store.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("login", "status", "logout"):
+        command = commands.add_parser(name)
+        command.add_argument(
+            "--ws-url",
+            default=DEFAULT_WS_URL,
+            metavar="URL",
+            help=f"hosted engine WebSocket URL (default: {DEFAULT_WS_URL})",
+        )
+    args = parser.parse_args(argv)
+
+    if args.command == "login":
+        api_key = getpass.getpass("Respan API key: ").strip()
+        if not api_key:
+            print("error: API key cannot be empty", file=sys.stderr)
+            return 2
+        try:
+            asyncio.run(_validate_api_key(args.ws_url, api_key))
+            save_api_key(args.ws_url, api_key)
+        except CredentialStoreUnavailable:
+            _error(
+                "system credential store is unavailable",
+                hint="Configure a system keyring or set RESPAN_API_KEY for this shell.",
+            )
+            return 2
+        except Exception as exc:  # noqa: BLE001 -- auth/network errors are user-facing.
+            _error("could not authenticate", exc, hint="Check the key and hosted engine URL.")
+            return 2
+        print("Authenticated. API key saved in the system credential store.")
+        return 0
+
+    try:
+        if args.command == "status":
+            environment = os.environ.get("RESPAN_API_KEY") or os.environ.get(
+                "RESPAN_REDTEAM_API_KEY"
+            )
+            if environment:
+                print("API key configured in the environment.")
+                return 0
+            stored = load_stored_api_key(args.ws_url)
+            if stored:
+                print("API key configured in the system credential store.")
+                return 0
+            print("Not authenticated. Run `respan-redteam auth login`.")
+            return 1
+        deleted = delete_api_key(args.ws_url)
+    except CredentialStoreUnavailable:
+        _error(
+            "system credential store is unavailable",
+            hint="Configure a system keyring or use RESPAN_API_KEY for this shell.",
+        )
+        return 2
+    print("Logged out." if deleted else "No stored API key was found.")
+    if os.environ.get("RESPAN_API_KEY") or os.environ.get("RESPAN_REDTEAM_API_KEY"):
+        print("RESPAN_API_KEY remains set in the environment and still takes precedence.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "auth":
+        return _auth_main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="respan-redteam",
         description="Run an autonomous red-team campaign against your own AI agent.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
+  respan-redteam auth login
   respan-redteam ./adapter.py
   respan-redteam ./adapter.py --local
   respan-redteam ./adapter.py -f json -o report.json
@@ -510,9 +595,9 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
                       help=f"remote-scan engine WebSocket URL (default: {DEFAULT_WS_URL})")
     mode.add_argument(
         "--api-key",
-        default=DEFAULT_API_KEY,
+        default=None,
         metavar="KEY",
-        help="Respan API key for remote scans (default: RESPAN_API_KEY)",
+        help="Respan API key for this scan (prefer auth login or RESPAN_API_KEY)",
     )
     mode.add_argument("--retries", type=int, default=3, metavar="N",
                       help="remote connection attempts with backoff; must be >= 1 (default: 3)")
@@ -547,8 +632,13 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
         parser.error("--retries and --adapter-retries must be at least 1")
     if args.connect_timeout <= 0 or args.adapter_timeout <= 0:
         parser.error("timeouts must be greater than zero")
-    if not args.local and not args.api_key:
-        parser.error("remote scans require --api-key or RESPAN_API_KEY")
+    if not args.local:
+        args.api_key, _credential_source = resolve_api_key(args.ws_url, args.api_key)
+        if not args.api_key:
+            parser.error(
+                "remote scans require authentication; run `respan-redteam auth login` "
+                "or set RESPAN_API_KEY"
+            )
     if args.json:
         if args.format is not None:
             parser.error("use either --json or --format, not both")

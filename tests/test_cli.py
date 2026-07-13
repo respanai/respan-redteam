@@ -7,14 +7,20 @@ import asyncio
 import io
 import os
 import tempfile
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
-from respan_redteam.cli import (_Progress, _campaign_url, _connect, _error, _explain, _load_adapter,
-                                _open_adapter, _required, _retryable_connection_error,
-                                _write_report)
+from respan_redteam.cli import (_Progress, _auth_main, _campaign_url, _connect, _error, _explain,
+                                _load_adapter, _open_adapter, _required,
+                                _retryable_connection_error, _validate_api_key, _write_report)
+from respan_redteam.credentials import (
+    CredentialStoreUnavailable,
+    credential_name,
+    resolve_api_key,
+    save_api_key,
+)
 
 
 def _progress(buf, *, terminal: bool, quiet: bool = False) -> _Progress:
@@ -47,6 +53,8 @@ _EVENTS = [
     ("finding.critical", {"title": "Secret", "severity": "critical"}),
     ("report.ready", {"grade": "F", "score": 40, "findings": 1, "probes": 12}),
 ]
+
+DEFAULT_URL = "wss://redteam.respan.ai/redteam/remote/"
 
 
 def test_nontty_logs_every_verdict_and_no_escapes():
@@ -212,6 +220,72 @@ def test_remote_connection_sends_bearer_api_key():
         if headers is None:
             headers = connect.await_args.kwargs["extra_headers"]
         assert headers == {"Authorization": "Bearer secret-key"}
+
+    asyncio.run(run())
+
+
+def test_credential_name_is_scoped_to_normalized_host():
+    assert credential_name("wss://RedTeam.Respan.AI/redteam/remote/") == "redteam.respan.ai"
+
+
+def test_api_key_resolution_prefers_flag_then_environment_then_keyring():
+    with patch.dict(os.environ, {"RESPAN_API_KEY": "from-env"}, clear=True), \
+         patch("respan_redteam.credentials.load_stored_api_key", return_value="stored"):
+        assert resolve_api_key(DEFAULT_URL, "from-flag") == ("from-flag", "--api-key")
+        assert resolve_api_key(DEFAULT_URL) == ("from-env", "environment")
+    with patch.dict(os.environ, {}, clear=True), \
+         patch("respan_redteam.credentials.load_stored_api_key", return_value="stored"):
+        assert resolve_api_key(DEFAULT_URL) == ("stored", "system credential store")
+
+
+def test_credential_save_rejects_a_backend_that_does_not_persist():
+    with patch("respan_redteam.credentials.keyring.set_password"), \
+         patch("respan_redteam.credentials.keyring.get_password", return_value=None):
+        try:
+            save_api_key(DEFAULT_URL, "secret")
+            assert False, "expected a non-persisting credential backend to fail"
+        except CredentialStoreUnavailable:
+            pass
+
+
+def test_auth_login_validates_before_saving_without_echoing_key():
+    output = io.StringIO()
+    with patch("respan_redteam.cli.getpass.getpass", return_value="secret-key"), \
+         patch("respan_redteam.cli._validate_api_key", new=AsyncMock()), \
+         patch("respan_redteam.cli.save_api_key") as save, redirect_stdout(output):
+        assert _auth_main(["login", "--ws-url", DEFAULT_URL]) == 0
+    save.assert_called_once_with(DEFAULT_URL, "secret-key")
+    assert "secret-key" not in output.getvalue()
+    assert "system credential store" in output.getvalue()
+
+
+def test_auth_login_does_not_save_a_rejected_key():
+    output = io.StringIO()
+    rejected = AsyncMock(side_effect=RuntimeError("rejected"))
+    with patch("respan_redteam.cli.getpass.getpass", return_value="bad-key"), \
+         patch("respan_redteam.cli._validate_api_key", new=rejected), \
+         patch("respan_redteam.cli.save_api_key") as save, redirect_stderr(output):
+        assert _auth_main(["login", "--ws-url", DEFAULT_URL]) == 2
+    save.assert_not_called()
+    assert "bad-key" not in output.getvalue()
+
+
+def test_auth_status_honors_environment_without_touching_keyring():
+    output = io.StringIO()
+    with patch.dict(os.environ, {"RESPAN_API_KEY": "secret"}, clear=True), \
+         patch("respan_redteam.cli.load_stored_api_key") as load, redirect_stdout(output):
+        assert _auth_main(["status"]) == 0
+    load.assert_not_called()
+    assert "configured in the environment" in output.getvalue()
+    assert "secret" not in output.getvalue()
+
+
+def test_validate_api_key_closes_the_authenticated_socket():
+    async def run():
+        connection = AsyncMock()
+        with patch("respan_redteam.cli._connect", new=AsyncMock(return_value=connection)):
+            await _validate_api_key(DEFAULT_URL, "secret")
+        connection.close.assert_awaited_once()
 
     asyncio.run(run())
 

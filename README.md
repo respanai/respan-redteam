@@ -55,11 +55,18 @@ and a
 The default remote scan uses Respan's hosted engine:
 
 ```bash
-export RESPAN_API_KEY=...
+respan-redteam auth login
 respan-redteam adapter.py -o report.json
 ```
 
-Remote scans require a Respan API key. You can alternatively pass it with `--api-key`.
+`auth login` validates your Respan API key and saves it in the operating system credential
+manager (macOS Keychain, Windows Credential Manager, or Linux Secret Service). The CLI never
+writes the key to a plaintext config file. Use `respan-redteam auth status` or
+`respan-redteam auth logout` to inspect or remove it.
+
+For CI and other headless environments, set `RESPAN_API_KEY`. You can alternatively pass
+`--api-key`, but environment variables are preferable because command arguments may be retained
+in shell history or exposed in process listings.
 
 To run the engine locally, provide an OpenAI-compatible API key:
 
