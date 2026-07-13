@@ -28,6 +28,8 @@ import importlib.util
 import inspect
 import json
 import os
+import shlex
+import subprocess
 from pathlib import Path
 import sys
 import traceback
@@ -40,6 +42,8 @@ from rich.table import Table
 from rich.text import Text
 
 from . import DEFAULT_BUDGET, run_campaign
+from . import config as engine_config
+from .config import BudgetConfig
 from .credentials import (
     CredentialStoreUnavailable,
     delete_api_key,
@@ -47,21 +51,51 @@ from .credentials import (
     resolve_api_key,
     save_api_key,
 )
-
-DEFAULT_WS_URL = os.environ.get(
-    "RESPAN_REDTEAM_WS_URL", "wss://redteam.respan.ai/redteam/remote/",
+from .user_config import (
+    ProfileConfig,
+    UserConfigError,
+    config_path,
+    load_profile,
+    read_config,
+    render_profile,
+    selected_profile,
+    set_profile_value,
+    set_selected_profile,
+    unset_profile_value,
+    write_config,
 )
+
+BUILTIN_SERVER = "https://redteam.respan.ai"
+DEFAULT_SERVER = os.environ.get("RESPAN_REDTEAM_SERVER", BUILTIN_SERVER)
+DEFAULT_WS_URL = os.environ.get("RESPAN_REDTEAM_WS_URL", "")
 try:
     from importlib.metadata import version
     __version__ = version("respan-redteam")
 except Exception:  # package metadata is optional in a source checkout
-    __version__ = "0.1.1"
+    __version__ = "0.1.2"
 
 # rich styles (rich itself handles terminal detection, NO_COLOR, and FORCE_COLOR).
 _GRADE_STYLE = {"A": "bold green", "B": "green", "C": "bold yellow",
                 "D": "red", "F": "bold red", "n/a": "dim"}
 _SEV_STYLE = {"critical": "bold red", "high": "red", "medium": "yellow", "low": "dim"}
 _VERDICT_ICON = {"success": "✓", "partial": "~", "refused": "·", "error": "!"}
+
+
+def _server_to_ws_url(server: str) -> str:
+    """Accept a friendly HTTP origin or the legacy full WebSocket endpoint."""
+    value = server.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme in ("ws", "wss"):
+        if not parsed.netloc:
+            raise ValueError("server URL has no hostname")
+        path = parsed.path or "/redteam/remote/"
+        if not path.endswith("/"):
+            path += "/"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, ""))
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("server must be an http(s) or ws(s) URL")
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return urlunsplit((scheme, parsed.netloc, "/redteam/remote/", "", ""))
 
 
 class _Progress:
@@ -503,15 +537,36 @@ def _auth_main(argv: list[str]) -> int:
         description="Manage the Respan API key in your system credential store.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("login", "status", "logout"):
-        command = commands.add_parser(name)
+    descriptions = {
+        "login": "validate and save an API key",
+        "status": "show where the active API key comes from",
+        "logout": "remove the saved API key",
+    }
+    for name, description in descriptions.items():
+        command = commands.add_parser(name, help=description, description=description)
         command.add_argument(
-            "--ws-url",
-            default=DEFAULT_WS_URL,
+            "--server",
+            default=None,
             metavar="URL",
-            help=f"hosted engine WebSocket URL (default: {DEFAULT_WS_URL})",
+            help=f"Respan server origin (default: {DEFAULT_SERVER})",
+        )
+        command.add_argument("--profile", metavar="NAME", help="configuration profile")
+        command.add_argument(
+            "--ws-url", dest="server", default=argparse.SUPPRESS, help=argparse.SUPPRESS
         )
     args = parser.parse_args(argv)
+    try:
+        profile = load_profile(args.profile)
+        if profile.mode != "hosted":
+            raise UserConfigError(
+                f"profile {profile.name!r} is local; Respan authentication requires a hosted profile"
+            )
+        server = args.server or DEFAULT_WS_URL or os.environ.get(
+            "RESPAN_REDTEAM_SERVER"
+        ) or profile.server or BUILTIN_SERVER
+        ws_url = _server_to_ws_url(server)
+    except (ValueError, UserConfigError) as exc:
+        parser.error(str(exc))
 
     if args.command == "login":
         api_key = getpass.getpass("Respan API key: ").strip()
@@ -519,8 +574,8 @@ def _auth_main(argv: list[str]) -> int:
             print("error: API key cannot be empty", file=sys.stderr)
             return 2
         try:
-            asyncio.run(_validate_api_key(args.ws_url, api_key))
-            save_api_key(args.ws_url, api_key)
+            asyncio.run(_validate_api_key(ws_url, api_key))
+            save_api_key(ws_url, api_key)
         except CredentialStoreUnavailable:
             _error(
                 "system credential store is unavailable",
@@ -541,13 +596,13 @@ def _auth_main(argv: list[str]) -> int:
             if environment:
                 print("API key configured in the environment.")
                 return 0
-            stored = load_stored_api_key(args.ws_url)
+            stored = load_stored_api_key(ws_url)
             if stored:
                 print("API key configured in the system credential store.")
                 return 0
             print("Not authenticated. Run `respan-redteam auth login`.")
             return 1
-        deleted = delete_api_key(args.ws_url)
+        deleted = delete_api_key(ws_url)
     except CredentialStoreUnavailable:
         _error(
             "system credential store is unavailable",
@@ -560,39 +615,127 @@ def _auth_main(argv: list[str]) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
-    argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] == "auth":
-        return _auth_main(argv[1:])
+def _config_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        prog="respan-redteam",
+        prog="respan-redteam config",
+        description="Manage non-secret CLI profiles. API keys are never written here.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("path", help="print the configuration file path")
+    show = commands.add_parser("show", help="show the effective profile")
+    show.add_argument("--profile", metavar="NAME")
+    use = commands.add_parser("use", help="select the default profile")
+    use.add_argument("profile", metavar="NAME")
+    set_command = commands.add_parser("set", help="set one profile value")
+    set_command.add_argument("key", metavar="KEY")
+    set_command.add_argument("value", metavar="VALUE")
+    set_command.add_argument("--profile", metavar="NAME")
+    unset = commands.add_parser("unset", help="remove one profile value")
+    unset.add_argument("key", metavar="KEY")
+    unset.add_argument("--profile", metavar="NAME")
+    commands.add_parser("edit", help="open the TOML file in $VISUAL or $EDITOR")
+    args = parser.parse_args(argv)
+
+    if args.command == "path":
+        print(config_path())
+        return 0
+    try:
+        if args.command == "show":
+            print(render_profile(load_profile(args.profile)), end="")
+            print("# OPENAI_API_KEY: environment only")
+            print("# RESPAN_API_KEY: environment or system credential store")
+            return 0
+        if args.command == "use":
+            set_selected_profile(args.profile)
+            print(f"Using profile {args.profile!r}.")
+            return 0
+        if args.command in ("set", "unset"):
+            data = read_config()
+            profile_name = args.profile or selected_profile(data)
+            if args.command == "set":
+                set_profile_value(profile_name, args.key, args.value)
+                print(f"Set {args.key} in profile {profile_name!r}.")
+            else:
+                unset_profile_value(profile_name, args.key)
+                print(f"Removed {args.key} from profile {profile_name!r}.")
+            return 0
+        path = config_path()
+        if not path.exists():
+            write_config(
+                {
+                    "profile": "default",
+                    "profiles": {
+                        "default": {"mode": "hosted", "server": DEFAULT_SERVER}
+                    },
+                }
+            )
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if not editor:
+            raise UserConfigError("set $VISUAL or $EDITOR before using `config edit`")
+        completed = subprocess.run([*shlex.split(editor), str(path)], check=False)
+        if completed.returncode != 0:
+            return completed.returncode
+        load_profile()
+        return 0
+    except UserConfigError as exc:
+        _error("invalid configuration", exc, hint=f"Edit {config_path()} or run `config show`.")
+        return 2
+
+
+def _apply_local_profile(profile: ProfileConfig) -> BudgetConfig:
+    settings = {
+        "OPENAI_BASE_URL": ("OPENAI_BASE_URL", profile.openai_base_url),
+        "MODEL_ATTACKER": ("RESPAN_MODEL_ATTACKER", profile.model_attacker),
+        "MODEL_JUDGE_GATE": ("RESPAN_MODEL_JUDGE_GATE", profile.model_judge_gate),
+        "MODEL_JUDGE_GRADE": ("RESPAN_MODEL_JUDGE_GRADE", profile.model_judge_grade),
+        "MODEL_RECON": ("RESPAN_MODEL_RECON", profile.model_recon),
+    }
+    for attribute, (environment, configured) in settings.items():
+        if environment not in os.environ and configured is not None:
+            setattr(engine_config, attribute, configured)
+    engine_config.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+    values = {
+        field_name: getattr(DEFAULT_BUDGET, field_name)
+        for field_name in BudgetConfig.__dataclass_fields__
+    }
+    values.update(profile.budget)
+    return BudgetConfig(**values)
+
+
+def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
+    parser = argparse.ArgumentParser(
+        prog="respan-redteam" if legacy else "respan-redteam scan",
         description="Run an autonomous red-team campaign against your own AI agent.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
-  respan-redteam auth login
-  respan-redteam ./adapter.py
-  respan-redteam ./adapter.py --local
-  respan-redteam ./adapter.py -f json -o report.json
-  respan-redteam ./adapter.py --fail-under B
-
-No adapter yet? See https://redteam.respan.ai/setup.txt""",
+  respan-redteam scan adapter.py
+  respan-redteam scan adapter.py --output report.json
+  respan-redteam scan adapter.py --fail-under B
+  respan-redteam scan adapter.py --local""",
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    parser.add_argument("adapter", nargs="?", metavar="ADAPTER",
-                        help="path to adapter.py (may also be passed with --adapter)")
+    parser.add_argument("adapter", nargs="?" if legacy else None, metavar="ADAPTER",
+                        help="Python file that connects the scanner to your agent")
     tgt = parser.add_argument_group("target — your agent")
-    tgt.add_argument("--adapter", dest="adapter_option", metavar="PATH",
-                     help="path to your adapter.py: a Target with .open() -> Chat")
+    if legacy:
+        tgt.add_argument("--adapter", dest="adapter_option", metavar="PATH",
+                         help=argparse.SUPPRESS)
+    else:
+        parser.set_defaults(adapter_option=None)
     tgt.add_argument("-s", "--symbol", metavar="NAME",
                      help="name of the Target/factory in the adapter module (default: auto-detect)")
+    tgt.add_argument("--profile", metavar="NAME", help="configuration profile")
 
-    mode = parser.add_argument_group("scan mode")
-    mode.add_argument("-l", "--local", action="store_true",
-                      help="run the engine in-process on this machine (needs an OpenAI key). Default "
-                           "is a REMOTE scan: the engine exchanges chat messages with your local "
-                           "adapter over a WebSocket.")
-    mode.add_argument("--ws-url", dest="ws_url", default=DEFAULT_WS_URL, metavar="URL",
-                      help=f"remote-scan engine WebSocket URL (default: {DEFAULT_WS_URL})")
+    mode = parser.add_argument_group("execution")
+    execution_mode = mode.add_mutually_exclusive_group()
+    execution_mode.add_argument("-l", "--local", dest="local", action="store_true", default=None,
+                      help="run the engine locally instead of using Respan's hosted engine")
+    execution_mode.add_argument("--hosted", dest="local", action="store_false",
+                                help="use Respan's hosted engine")
+    mode.add_argument("--server", default=None, metavar="URL",
+                      help=f"Respan server origin (default: {DEFAULT_SERVER})")
+    mode.add_argument(
+        "--ws-url", dest="server", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
     mode.add_argument(
         "--api-key",
         default=None,
@@ -600,13 +743,13 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
         help="Respan API key for this scan (prefer auth login or RESPAN_API_KEY)",
     )
     mode.add_argument("--retries", type=int, default=3, metavar="N",
-                      help="remote connection attempts with backoff; must be >= 1 (default: 3)")
+                      help=argparse.SUPPRESS)
     mode.add_argument("--connect-timeout", type=float, default=15, metavar="SECONDS",
-                      help="timeout for each remote connection attempt (default: 15)")
+                      help=argparse.SUPPRESS)
     mode.add_argument("--adapter-timeout", type=float, default=120, metavar="SECONDS",
-                      help="timeout for adapter open/send calls (default: 120)")
+                      help=argparse.SUPPRESS)
     mode.add_argument("--adapter-retries", type=int, default=2, metavar="N",
-                      help="adapter open attempts; sends are never replayed (default: 2)")
+                      help=argparse.SUPPRESS)
 
     out = parser.add_argument_group("output")
     out.add_argument("-q", "--quiet", action="store_true",
@@ -614,25 +757,39 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
     out.add_argument("-f", "--format", choices=("text", "json"),
                      help="report format (default: text; inferred from a .json output path)")
     out.add_argument("--json", action="store_true",
-                     help="shortcut for --format json (kept for compatibility)")
+                     help=argparse.SUPPRESS)
     out.add_argument("-o", "--output", metavar="PATH",
                      help="write the report to PATH instead of stdout; creates parent directories")
     out.add_argument("--fail-under", metavar="GRADE", choices=["A", "B", "C", "D", "F"],
                      help="exit 4 if the campaign grade is below GRADE (CI gate)")
     out.add_argument("--debug", action="store_true",
-                     help="include a traceback for unexpected local CLI failures")
+                     help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+
+    try:
+        profile = load_profile(args.profile)
+    except UserConfigError as exc:
+        parser.error(str(exc))
+    if args.local is None:
+        args.local = profile.mode == "local"
 
     if args.adapter and args.adapter_option:
         parser.error("pass the adapter once, either as ADAPTER or with --adapter")
     adapter = args.adapter_option or args.adapter
     if not adapter:
-        parser.error("an adapter is required (respan-redteam ./adapter.py)")
+        parser.error("an adapter is required (respan-redteam scan adapter.py)")
     if args.retries < 1 or args.adapter_retries < 1:
         parser.error("--retries and --adapter-retries must be at least 1")
     if args.connect_timeout <= 0 or args.adapter_timeout <= 0:
         parser.error("timeouts must be greater than zero")
     if not args.local:
+        try:
+            server = args.server or DEFAULT_WS_URL or os.environ.get(
+                "RESPAN_REDTEAM_SERVER"
+            ) or profile.server or BUILTIN_SERVER
+            args.ws_url = _server_to_ws_url(server)
+        except ValueError as exc:
+            parser.error(str(exc))
         args.api_key, _credential_source = resolve_api_key(args.ws_url, args.api_key)
         if not args.api_key:
             parser.error(
@@ -644,7 +801,12 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
             parser.error("use either --json or --format, not both")
         args.format = "json"
     if args.format is None:
-        args.format = "json" if args.output and args.output.lower().endswith(".json") else "text"
+        args.format = (
+            "json" if args.output and args.output.lower().endswith(".json")
+            else profile.output_format or "text"
+        )
+    if args.fail_under is None:
+        args.fail_under = profile.fail_under
 
     try:
         target = _load_adapter(adapter, args.symbol)
@@ -654,7 +816,8 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
                debug=args.debug)
         return 2
 
-    prog = _Progress(quiet=args.quiet, probe_cap=DEFAULT_BUDGET.max_target_probes)
+    budget = _apply_local_profile(profile) if args.local else DEFAULT_BUDGET
+    prog = _Progress(quiet=args.quiet, probe_cap=budget.max_target_probes)
 
     # --- REMOTE scan (default): engine on the server, your agent on this machine (over WebSocket) ---
     if not args.local:
@@ -672,13 +835,13 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
         except Exception as exc:  # noqa: BLE001 -- connect exhausted / unexpected: no traceback
             prog.close()
             _error("could not run remote scan", exc,
-                   hint="Check --ws-url and network access; use --debug for adapter failures.",
+                   hint="Check --server and network access; use --debug for adapter failures.",
                    debug=args.debug)
             return 2
 
     # --- LOCAL scan: run the engine in-process against the adapter ---
     try:
-        result = run_campaign(target, sink=prog.sink)
+        result = run_campaign(target, cfg=budget, sink=prog.sink)
     except KeyboardInterrupt:
         prog.close()
         print("\ninterrupted", file=sys.stderr)
@@ -697,6 +860,49 @@ No adapter yet? See https://redteam.respan.ai/setup.txt""",
         print(f"error: could not write report: {exc}", file=sys.stderr)
         return 1
     return _grade_exit_code(report["grade"], args.fail_under)
+
+
+def _root_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="respan-redteam",
+        description="Find security weaknesses in your AI agent with an adaptive attack campaign.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""quickstart:
+  respan-redteam auth login
+  respan-redteam scan adapter.py --output report.json
+
+Run `respan-redteam <command> --help` for command-specific options.""",
+    )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
+    commands.add_parser("scan", add_help=False, help="run a red-team campaign")
+    commands.add_parser("auth", add_help=False, help="manage your Respan API key")
+    commands.add_parser("config", add_help=False, help="manage non-secret CLI profiles")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        _root_parser().print_help()
+        return 0
+    if argv[0] == "scan":
+        return _scan_main(argv[1:])
+    if argv[0] == "auth":
+        return _auth_main(argv[1:])
+    if argv[0] == "config":
+        return _config_main(argv[1:])
+    if argv[0] in ("-h", "--help", "--version"):
+        _root_parser().parse_args(argv)
+        return 0
+    # Backward compatibility for 0.1.x: `respan-redteam adapter.py [options]`.
+    first = argv[0]
+    if first.startswith("-") or first.endswith(".py") or Path(first).exists():
+        return _scan_main(argv, legacy=True)
+    _root_parser().error(
+        f"unknown command {first!r}; choose `scan`, `auth`, or `config`"
+    )
+    return 2
 
 
 if __name__ == "__main__":

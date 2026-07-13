@@ -2,9 +2,13 @@
 
 Run a remote scan with:
 
-    python -m respan_redteam --adapter examples/adapter_local.py \
-        --api-key "$RESPAN_API_KEY" \
-        --ws-url ws://127.0.0.1:8000/redteam/remote/
+    respan-redteam auth login
+    respan-redteam scan examples/adapter_local.py
+
+For a self-hosted development server:
+
+    RESPAN_API_KEY=... respan-redteam scan examples/adapter_local.py \
+        --server http://127.0.0.1:8000
 
 An adapter exposes `.open() -> Chat`; the chat implements `.send(user_message) -> str` and
 `.transcript() -> list[dict]`. Replace this deliberately leaky bot with calls to your own agent.

@@ -12,15 +12,19 @@ from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
-from respan_redteam.cli import (_Progress, _auth_main, _campaign_url, _connect, _error, _explain,
+from respan_redteam import config as engine_config
+from respan_redteam.cli import (_Progress, _apply_local_profile, _auth_main, _campaign_url,
+                                _connect, _error, _explain,
                                 _load_adapter, _open_adapter, _required,
-                                _retryable_connection_error, _validate_api_key, _write_report)
+                                _retryable_connection_error, _scan_main, _server_to_ws_url,
+                                _validate_api_key, _write_report, main as cli_main)
 from respan_redteam.credentials import (
     CredentialStoreUnavailable,
     credential_name,
     resolve_api_key,
     save_api_key,
 )
+from respan_redteam.user_config import ProfileConfig
 
 
 def _progress(buf, *, terminal: bool, quiet: bool = False) -> _Progress:
@@ -186,6 +190,14 @@ def test_campaign_url_discards_websocket_route():
     ) == "http://localhost:8000/campaign/campaign-2"
 
 
+def test_server_origin_becomes_remote_websocket_endpoint():
+    assert _server_to_ws_url("https://redteam.respan.ai") == DEFAULT_URL
+    assert _server_to_ws_url("http://localhost:8000/") == (
+        "ws://localhost:8000/redteam/remote/"
+    )
+    assert _server_to_ws_url("wss://example.com/custom") == "wss://example.com/custom/"
+
+
 def test_adapter_open_retries_network_failure():
     class Target:
         calls = 0
@@ -259,6 +271,15 @@ def test_auth_login_validates_before_saving_without_echoing_key():
     assert "system credential store" in output.getvalue()
 
 
+def test_auth_login_accepts_a_friendly_server_origin():
+    with patch("respan_redteam.cli.getpass.getpass", return_value="secret-key"), \
+         patch("respan_redteam.cli._validate_api_key", new=AsyncMock()) as validate, \
+         patch("respan_redteam.cli.save_api_key") as save, redirect_stdout(io.StringIO()):
+        assert _auth_main(["login", "--server", "https://redteam.respan.ai"]) == 0
+    validate.assert_awaited_once_with(DEFAULT_URL, "secret-key")
+    save.assert_called_once_with(DEFAULT_URL, "secret-key")
+
+
 def test_auth_login_does_not_save_a_rejected_key():
     output = io.StringIO()
     rejected = AsyncMock(side_effect=RuntimeError("rejected"))
@@ -288,6 +309,68 @@ def test_validate_api_key_closes_the_authenticated_socket():
         connection.close.assert_awaited_once()
 
     asyncio.run(run())
+
+
+def test_main_routes_scan_command_and_legacy_adapter_invocation():
+    with patch("respan_redteam.cli._scan_main", return_value=0) as scan:
+        assert cli_main(["scan", "adapter.py"]) == 0
+        scan.assert_called_once_with(["adapter.py"])
+    with patch("respan_redteam.cli._scan_main", return_value=0) as scan:
+        assert cli_main(["adapter.py", "--quiet"]) == 0
+        scan.assert_called_once_with(["adapter.py", "--quiet"], legacy=True)
+
+
+def test_main_without_arguments_prints_short_command_help():
+    output = io.StringIO()
+    with redirect_stdout(output):
+        assert cli_main([]) == 0
+    text = output.getvalue()
+    assert "scan" in text and "auth" in text
+    assert "--adapter-timeout" not in text
+
+
+def test_scan_accepts_server_origin_and_runs_remote_adapter():
+    target = type("Target", (), {"label": "test-agent"})()
+    remote = AsyncMock(return_value=0)
+    with patch("respan_redteam.cli._load_adapter", return_value=target), \
+         patch("respan_redteam.cli.resolve_api_key", return_value=("secret", "test")) as auth, \
+         patch("respan_redteam.cli._run_remote", new=remote):
+        assert _scan_main([
+            "adapter.py", "--server", "http://localhost:8000", "--quiet"
+        ]) == 0
+    auth.assert_called_once_with("ws://localhost:8000/redteam/remote/", None)
+    assert remote.await_args.args[0] == "ws://localhost:8000/redteam/remote/"
+
+
+def test_scan_without_credentials_points_to_auth_login():
+    output = io.StringIO()
+    with patch("respan_redteam.cli.resolve_api_key", return_value=(None, "none")), \
+         redirect_stderr(output):
+        try:
+            _scan_main(["adapter.py"])
+            assert False, "expected missing authentication to stop the scan"
+        except SystemExit as exc:
+            assert exc.code == 2
+    assert "respan-redteam auth login" in output.getvalue()
+
+
+def test_local_profile_applies_models_base_url_and_budget_but_key_stays_in_env():
+    profile = ProfileConfig(
+        name="local",
+        mode="local",
+        openai_base_url="http://localhost:11434/v1",
+        model_attacker="attacker-model",
+        budget={"max_target_probes": 12},
+    )
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "environment-key"}, clear=True), \
+         patch.object(engine_config, "OPENAI_API_KEY", None), \
+         patch.object(engine_config, "OPENAI_BASE_URL", None), \
+         patch.object(engine_config, "MODEL_ATTACKER", "default"):
+        budget = _apply_local_profile(profile)
+        assert engine_config.OPENAI_API_KEY == "environment-key"
+        assert engine_config.OPENAI_BASE_URL == "http://localhost:11434/v1"
+        assert engine_config.MODEL_ATTACKER == "attacker-model"
+        assert budget.max_target_probes == 12
 
 
 def main():
