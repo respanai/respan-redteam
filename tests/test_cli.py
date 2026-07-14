@@ -12,8 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
-from respan_redteam import config as engine_config
-from respan_redteam.cli import (_Progress, _apply_local_profile, _auth_main, _campaign_url,
+from respan_redteam.cli import (_Progress, _auth_main, _build_local_engine_config, _campaign_url,
                                 _connect, _error, _explain,
                                 _load_adapter, _open_adapter, _required,
                                 _retryable_connection_error, _scan_main, _server_to_ws_url,
@@ -354,7 +353,7 @@ def test_scan_without_credentials_points_to_auth_login():
     assert "respan-redteam auth login" in output.getvalue()
 
 
-def test_local_profile_applies_models_base_url_and_budget_but_key_stays_in_env():
+def test_local_profile_owns_models_while_base_url_and_key_allow_environment():
     profile = ProfileConfig(
         name="local",
         mode="local",
@@ -362,15 +361,27 @@ def test_local_profile_applies_models_base_url_and_budget_but_key_stays_in_env()
         model_attacker="attacker-model",
         budget={"max_target_probes": 12},
     )
-    with patch.dict(os.environ, {"OPENAI_API_KEY": "environment-key"}, clear=True), \
-         patch.object(engine_config, "OPENAI_API_KEY", None), \
-         patch.object(engine_config, "OPENAI_BASE_URL", None), \
-         patch.object(engine_config, "MODEL_ATTACKER", "default"):
-        budget = _apply_local_profile(profile)
-        assert engine_config.OPENAI_API_KEY == "environment-key"
-        assert engine_config.OPENAI_BASE_URL == "http://localhost:11434/v1"
-        assert engine_config.MODEL_ATTACKER == "attacker-model"
-        assert budget.max_target_probes == 12
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "environment-key",
+                "RESPAN_MODEL_ATTACKER": "ignored-environment-model",
+            },
+            clear=True,
+        ),
+    ):
+        config = _build_local_engine_config(profile)
+        assert config.llm.api_key == "environment-key"
+        assert config.llm.base_url == "http://localhost:11434/v1"
+        assert config.llm.model_attacker == "attacker-model"
+        assert config.budget.max_target_probes == 12
+
+
+def test_local_profile_resets_unspecified_models_to_built_in_defaults():
+    with patch.dict(os.environ, {"RESPAN_MODEL_ATTACKER": "ignored"}, clear=True):
+        config = _build_local_engine_config(ProfileConfig(name="local", mode="local"))
+        assert config.llm.model_attacker == "gpt-4.1"
 
 
 def main():

@@ -6,8 +6,15 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .. import config, model_client
-from ..runtime import BudgetExhausted, budget_can_send, current_profile, emit, open_chat
+from .. import model_client
+from ..runtime import (
+    BudgetExhausted,
+    budget_can_send,
+    current_config,
+    current_profile,
+    emit,
+    open_chat,
+)
 from ..events import VerdictEvent
 from .attacker import history_str
 from ..models import JudgeVerdict, Outcome, Probe, Round, Severity
@@ -85,7 +92,7 @@ def _attacker_next(objective: str, must_include: str, conversation: list[dict]) 
                 f"{must_include}\n" if must_include else "")
     last = conversation[-1]["content"][:500] if conversation else "(none)"
     result = model_client.complete(
-        config.MODEL_ATTACKER,
+        current_config().llm.model_attacker,
         _ATTACKER_USER.format(
             profile=current_profile().context_block(), objective=objective,
             must_include=required, history=history_str(conversation, cap=300), last=last,

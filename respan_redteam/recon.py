@@ -5,8 +5,8 @@ from __future__ import annotations
 import base64
 import re
 
-from . import config, model_client
-from .runtime import BudgetExhausted, emit, open_chat
+from . import model_client
+from .runtime import BudgetExhausted, current_config, emit, open_chat
 from .events import ReconProbeResult, ReconProbeSent, ReconProfileReady
 from .models import ReconProfile, TargetType, DetectedTool, Probe, Round
 
@@ -124,7 +124,8 @@ def run_recon(recon_probes: int = 9) -> tuple[ReconProfile, list[Probe]]:
     profile = ReconProfile()
     try:
         data = model_client.complete_json(
-            config.MODEL_RECON, _SYNTH_USER.format(blob=blob[:14000]),
+            current_config().llm.model_recon,
+            _SYNTH_USER.format(blob=blob[:14000]),
             system=_SYNTH_SYSTEM, max_tokens=1600, temperature=0.2,
         )
         profile = _profile_from_json(data)

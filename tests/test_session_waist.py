@@ -4,9 +4,12 @@ attack-engine adaptation (no LLM calls).
 Run directly:  .venv/bin/python tests/test_session_waist.py   (also importable under pytest)."""
 from __future__ import annotations
 
-from respan_redteam.config import BudgetConfig
+import os
+from unittest.mock import patch
+
+from respan_redteam.config import BudgetConfig, EngineConfig, LLMConfig
 from respan_redteam.runtime import (BudgetExhausted, campaign_scope, current_budget,
-                                     open_chat, probe, set_profile)
+                                     current_config, open_chat, probe, set_profile)
 from respan_redteam.prompts import all_prompts, compose
 from respan_redteam.carriers import carrier_by_name
 from respan_redteam.models import Outcome, ReconProfile
@@ -38,10 +41,65 @@ class _EchoTarget:
         self.chats: list[_EchoChat] = []
 
     def open(self) -> _EchoChat:
-        c = _EchoChat()
-        self.chats.append(c)
-        return c
+        chat = _EchoChat()
+        self.chats.append(chat)
+        return chat
 
+
+def test_engine_config_is_explicit_and_campaign_scoped():
+    configured = EngineConfig(
+        llm=LLMConfig(
+            api_key="explicit-key",
+            base_url="http://provider.example/v1",
+            model_attacker="profile-model",
+        ),
+        budget=BudgetConfig(max_target_probes=3),
+    )
+    with patch.dict(
+        os.environ,
+        {
+            "OPENAI_API_KEY": "ignored-key",
+            "OPENAI_BASE_URL": "http://ignored.example/v1",
+            "RESPAN_MODEL_ATTACKER": "ignored-model",
+        },
+        clear=True,
+    ):
+        with campaign_scope(configured, _EchoTarget()):
+            assert current_config() == configured
+            assert current_config().llm.api_key == "explicit-key"
+            assert current_config().llm.model_attacker == "profile-model"
+
+
+def test_model_client_uses_only_campaign_provider_config():
+    import respan_redteam.model_client as model_client
+
+    configured = EngineConfig(
+        llm=LLMConfig(
+            api_key="campaign-key",
+            base_url="http://campaign-provider.example/v1",
+        )
+    )
+    model_client._client_for.cache_clear()
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "ignored-key",
+                "OPENAI_BASE_URL": "http://ignored-provider.example/v1",
+            },
+            clear=True,
+        ),
+        patch("respan_redteam.model_client.OpenAI") as openai_client,
+        campaign_scope(configured, _EchoTarget()),
+    ):
+        model_client._client()
+    openai_client.assert_called_once_with(
+        api_key="campaign-key",
+        base_url="http://campaign-provider.example/v1",
+        timeout=120,
+        max_retries=0,
+    )
+    model_client._client_for.cache_clear()
 
 class _BoomChat:
     def send(self, user_message: str) -> str:

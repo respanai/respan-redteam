@@ -168,8 +168,10 @@ profile; mixed profiles are rejected rather than silently ignoring settings.
 API keys are never written to TOML. `RESPAN_API_KEY` uses the environment or operating-system
 credential manager, while `OPENAI_API_KEY` remains environment-only.
 
-Configuration precedence is: CLI flag, environment variable, selected profile, built-in default.
-Use `--profile NAME` to select a profile for one scan without changing the default.
+Model IDs are configured only in the selected local profile, with built-in defaults for omitted
+values. Environment variables do not override model selection. Other settings retain their
+documented CLI or environment overrides. Use `--profile NAME` to select a profile for one scan
+without changing the default.
 
 ## What happens during a scan?
 
@@ -202,8 +204,8 @@ respan-redteam scan adapter.py --local --output report.json
 ```
 
 Local execution supports `OPENAI_BASE_URL` for OpenAI-compatible providers. Model selection and
-budget settings are documented in
-[`respan_redteam/config.py`](https://github.com/respanai/respan-redteam/blob/main/respan_redteam/config.py).
+budget settings come from the selected TOML profile. The CLI reads `.env` and the shell for
+provider credentials; the engine itself does not read environment variables.
 
 ## CI example
 
@@ -234,13 +236,27 @@ An adapter may export `TARGET`, `build_target()`, or another symbol selected wit
 Local campaigns can also be started directly from Python:
 
 ```python
-from respan_redteam import run_campaign
+from respan_redteam import EngineConfig, LLMConfig, run_campaign
 from adapter import TARGET
 
-result = run_campaign(TARGET)
+config = EngineConfig(
+    llm=LLMConfig(
+        api_key=get_provider_api_key(),
+        base_url="https://api.openai.com/v1",
+        model_attacker="gpt-4.1",
+        model_judge_gate="gpt-4.1-mini",
+        model_judge_grade="gpt-4.1",
+        model_recon="gpt-4.1",
+    )
+)
+result = run_campaign(TARGET, config=config)
 print(result.grade(), result.score())
 print(result.to_report())
 ```
+
+Library hosts must construct `EngineConfig` explicitly. This keeps configuration ownership in the
+embedding application: the CLI may use dotenv and TOML, while a hosted backend may use its settings
+and secret-management system.
 
 ## Extend the engine
 

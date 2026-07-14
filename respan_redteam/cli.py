@@ -40,10 +40,10 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 from rich.text import Text
+from dotenv import find_dotenv, load_dotenv
 
 from . import DEFAULT_BUDGET, run_campaign
-from . import config as engine_config
-from .config import BudgetConfig
+from .config import BudgetConfig, EngineConfig, LLMConfig
 from .credentials import (
     CredentialStoreUnavailable,
     delete_api_key,
@@ -65,6 +65,8 @@ from .user_config import (
     write_config,
 )
 
+load_dotenv(find_dotenv(usecwd=True) or find_dotenv(), override=False)
+
 BUILTIN_SERVER = "https://redteam.respan.ai"
 DEFAULT_SERVER = os.environ.get("RESPAN_REDTEAM_SERVER", BUILTIN_SERVER)
 DEFAULT_WS_URL = os.environ.get("RESPAN_REDTEAM_WS_URL", "")
@@ -72,7 +74,7 @@ try:
     from importlib.metadata import version
     __version__ = version("respan-redteam")
 except Exception:  # package metadata is optional in a source checkout
-    __version__ = "0.1.2"
+    __version__ = "0.1.3"
 
 # rich styles (rich itself handles terminal detection, NO_COLOR, and FORCE_COLOR).
 _GRADE_STYLE = {"A": "bold green", "B": "green", "C": "bold yellow",
@@ -682,24 +684,24 @@ def _config_main(argv: list[str]) -> int:
         return 2
 
 
-def _apply_local_profile(profile: ProfileConfig) -> BudgetConfig:
-    settings = {
-        "OPENAI_BASE_URL": ("OPENAI_BASE_URL", profile.openai_base_url),
-        "MODEL_ATTACKER": ("RESPAN_MODEL_ATTACKER", profile.model_attacker),
-        "MODEL_JUDGE_GATE": ("RESPAN_MODEL_JUDGE_GATE", profile.model_judge_gate),
-        "MODEL_JUDGE_GRADE": ("RESPAN_MODEL_JUDGE_GRADE", profile.model_judge_grade),
-        "MODEL_RECON": ("RESPAN_MODEL_RECON", profile.model_recon),
-    }
-    for attribute, (environment, configured) in settings.items():
-        if environment not in os.environ and configured is not None:
-            setattr(engine_config, attribute, configured)
-    engine_config.OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+def _build_local_engine_config(profile: ProfileConfig) -> EngineConfig:
+    llm_defaults = LLMConfig()
     values = {
         field_name: getattr(DEFAULT_BUDGET, field_name)
         for field_name in BudgetConfig.__dataclass_fields__
     }
     values.update(profile.budget)
-    return BudgetConfig(**values)
+    return EngineConfig(
+        llm=LLMConfig(
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            base_url=os.environ.get("OPENAI_BASE_URL") or profile.openai_base_url,
+            model_attacker=profile.model_attacker or llm_defaults.model_attacker,
+            model_judge_gate=profile.model_judge_gate or llm_defaults.model_judge_gate,
+            model_judge_grade=profile.model_judge_grade or llm_defaults.model_judge_grade,
+            model_recon=profile.model_recon or llm_defaults.model_recon,
+        ),
+        budget=BudgetConfig(**values),
+    )
 
 
 def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
@@ -816,7 +818,8 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
                debug=args.debug)
         return 2
 
-    budget = _apply_local_profile(profile) if args.local else DEFAULT_BUDGET
+    local_config = _build_local_engine_config(profile) if args.local else None
+    budget = local_config.budget if local_config is not None else DEFAULT_BUDGET
     prog = _Progress(quiet=args.quiet, probe_cap=budget.max_target_probes)
 
     # --- REMOTE scan (default): engine on the server, your agent on this machine (over WebSocket) ---
@@ -840,8 +843,9 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
             return 2
 
     # --- LOCAL scan: run the engine in-process against the adapter ---
+    assert local_config is not None
     try:
-        result = run_campaign(target, cfg=budget, sink=prog.sink)
+        result = run_campaign(target, config=local_config, sink=prog.sink)
     except KeyboardInterrupt:
         prog.close()
         print("\ninterrupted", file=sys.stderr)
