@@ -5,26 +5,48 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 from openai import OpenAI
 
-from . import config
+from .config import LLMConfig
 from .runtime import Usage, record_usage   # token usage is recorded into the ambient campaign
+from .runtime import current_config
 
-_CLIENT: OpenAI | None = None
+_DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+_NO_API_KEY = "not-required"
+
+
+@lru_cache(maxsize=16)
+def _client_for(config: LLMConfig) -> OpenAI:
+    """Cache clients by immutable config without consulting the process environment."""
+    return OpenAI(
+        api_key=config.api_key or _NO_API_KEY,
+        base_url=config.base_url or _DEFAULT_OPENAI_BASE_URL,
+        timeout=120,
+        max_retries=0,
+    )
 
 
 def _client() -> OpenAI:
-    global _CLIENT
-    if _CLIENT is None:
-        kwargs: dict[str, Any] = {"timeout": 120, "max_retries": 0}
-        if config.OPENAI_API_KEY:
-            kwargs["api_key"] = config.OPENAI_API_KEY
-        if config.OPENAI_BASE_URL:
-            kwargs["base_url"] = config.OPENAI_BASE_URL
-        _CLIENT = OpenAI(**kwargs)
-    return _CLIENT
+    return _client_for(current_config().llm)
+
+
+def _create_chat_completion(*, model_id: str, messages: list[dict[str, str]],
+                            max_tokens: int, temperature: float):
+    """Call Chat Completions across legacy and GPT-5 parameter names.
+
+    GPT-5-family models reject the legacy ``max_tokens`` field and require
+    ``max_completion_tokens`` instead. Keeping the compatibility decision here
+    lets all attacker/recon/judge callers use the same model-independent API.
+    """
+    token_field = "max_completion_tokens" if model_id.startswith("gpt-5") else "max_tokens"
+    kwargs = {token_field: max_tokens}
+    # GPT-5 reasoning variants currently accept only their default temperature.
+    if not model_id.startswith("gpt-5") or temperature == 1.0:
+        kwargs["temperature"] = temperature
+    return _client().chat.completions.create(model=model_id, messages=messages, **kwargs)
 
 
 @dataclass
@@ -55,10 +77,8 @@ def complete(
     last_exc: Exception | None = None
     for attempt in range(max_retries):
         try:
-            resp = _client().chat.completions.create(
-                model=model_id,
-                messages=chat,
-                max_tokens=max_tokens,
+            resp = _create_chat_completion(
+                model_id=model_id, messages=chat, max_tokens=max_tokens,
                 temperature=temperature,
             )
             choice = resp.choices[0]

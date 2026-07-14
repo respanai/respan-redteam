@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 
 from .execution.agentic import CanaryCollector
-from .config import BudgetConfig, DEFAULT_BUDGET
+from .config import DEFAULT_ENGINE_CONFIG, BudgetConfig, EngineConfig
 from .runtime import (Usage, budget_remaining, campaign_scope,
                       current_budget, current_usage, emit, set_canary, set_profile)
 from .events import (CategoryStart, FindingDetected, ReportReady, SessionStart,
@@ -57,11 +57,16 @@ def _recon_disclosure_findings(profile, recon_probes) -> list[Finding]:
     return findings
 
 
-def run_campaign(target: Target, cfg: BudgetConfig = DEFAULT_BUDGET,
-                 sink: EventSink = null_sink) -> CampaignResult:
+def run_campaign(
+    target: Target,
+    config: EngineConfig | BudgetConfig = DEFAULT_ENGINE_CONFIG,
+    sink: EventSink = null_sink,
+) -> CampaignResult:
     label = getattr(target, "label", "target")
-    with campaign_scope(cfg, target, sink):           # the raw session Target is now ambient
-        return _run_campaign(label, cfg)
+    if isinstance(config, BudgetConfig):
+        config = EngineConfig(budget=config)
+    with campaign_scope(config, target, sink):
+        return _run_campaign(label, config.budget)
 
 
 def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:

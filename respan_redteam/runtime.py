@@ -10,7 +10,7 @@ from .events import AttackAttempt, TargetResponseEvent
 from .models import EventSink, ReconProfile
 
 if TYPE_CHECKING:
-    from .config import BudgetConfig
+    from .config import BudgetConfig, EngineConfig
     from .events import Event
 
 
@@ -51,7 +51,7 @@ class Budget:
 class CampaignRuntime:
     """All campaign-scoped state."""
     budget: Budget
-    cfg: "BudgetConfig"
+    config: "EngineConfig"
     usage: Usage = field(default_factory=Usage)
     sink: EventSink | None = None
     target: Any = None                      # the raw session Target (target.open() -> Chat)
@@ -70,10 +70,25 @@ def _cur() -> CampaignRuntime:
 
 
 @contextmanager
-def campaign_scope(cfg: "BudgetConfig", target: Any = None, sink: EventSink | None = None):
+def campaign_scope(
+    config: "EngineConfig | BudgetConfig",
+    target: Any = None,
+    sink: EventSink | None = None,
+):
     """Enter a campaign: set up ambient state for its duration. Uses contextvars so nested
     tasks/coroutines each see this context; on exit the previous context is restored."""
-    token = _ctx.set(CampaignRuntime(Budget(cfg.max_target_probes), cfg=cfg, sink=sink, target=target))
+    from .config import EngineConfig
+
+    if not isinstance(config, EngineConfig):
+        config = EngineConfig(budget=config)
+    token = _ctx.set(
+        CampaignRuntime(
+            Budget(config.budget.max_target_probes),
+            config=config,
+            sink=sink,
+            target=target,
+        )
+    )
     try:
         yield _ctx.get()
     finally:
@@ -90,7 +105,16 @@ def current_usage() -> Usage:
 
 
 def current_cfg() -> "BudgetConfig":
-    return _cur().cfg
+    return _cur().config.budget
+
+
+def current_config() -> "EngineConfig":
+    current = _ctx.get()
+    if current is not None:
+        return current.config
+    from .config import DEFAULT_ENGINE_CONFIG
+
+    return DEFAULT_ENGINE_CONFIG
 
 
 def current_profile() -> "ReconProfile":

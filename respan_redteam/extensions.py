@@ -1,4 +1,5 @@
 """Built-in assembly and direct registration of engine extensions."""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -14,21 +15,29 @@ from .strategies.framing import Framing
 from .strategies.indirect_injection import IndirectInjection
 from .strategies.refund_abuse import RefundAbuse
 from .strategies.ssrf import Ssrf
+from .strategies.structured_extraction import StructuredExtraction
+from .strategies.tool_chain import ProgressiveToolChain
 
 BUILTIN_STRATEGIES: tuple[Strategy, ...] = (
     Ssrf(),
+    ProgressiveToolChain(),
     IndirectInjection(),
     Exfiltration(),
     RefundAbuse(),
     Breadth(),
     Bypass(),
     Framing(),
+    StructuredExtraction(),
     Crescendo(),
 )
 
 
-def register_extensions(*, prompts: Iterable[PromptAttack] = (), carriers: Iterable[Carrier] = (),
-                        strategies: Iterable[Strategy] = ()) -> None:
+def register_extensions(
+    *,
+    prompts: Iterable[PromptAttack] = (),
+    carriers: Iterable[Carrier] = (),
+    strategies: Iterable[Strategy] = (),
+) -> None:
     """Register extension instances directly; individual names remain replacement-idempotent."""
     for prompt in prompts:
         register_prompt(prompt)
