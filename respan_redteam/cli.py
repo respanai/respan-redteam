@@ -258,10 +258,10 @@ def _required(msg: dict, *fields: str) -> None:
         raise RuntimeError(f"remote {msg.get('op', 'message')} omitted {', '.join(missing)}")
 
 
-# Hosted API host -> web-console assessment URL ({id} is the assessment id).
+# Hosted API host -> web-console campaign URL ({id} is the campaign id).
 _CONSOLE_URLS = {
-    "api.respan.ai": "https://platform.respan.ai/platform/red/assessments?assessment={id}",
-    "endpoint.respan.ai": "https://enterprise.respan.ai/platform/red/assessments?assessment={id}",
+    "api.respan.ai": "https://platform.respan.ai/platform/red/campaigns?campaign={id}",
+    "endpoint.respan.ai": "https://enterprise.respan.ai/platform/red/campaigns?campaign={id}",
 }
 
 

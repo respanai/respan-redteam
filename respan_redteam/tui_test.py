@@ -248,7 +248,7 @@ def mode_reconnect() -> list[EventPair]:
         _note("tui-test mode=reconnect"),
         _note("connect 1/3 failed (connection refused); retrying in 1s"),
         _note("connect 2/3 failed (timed out reaching the engine); retrying in 2s"),
-        _note("https://platform.respan.ai/platform/red/assessments?assessment=demo-1"),
+        _note("https://platform.respan.ai/platform/red/campaigns?campaign=demo-1"),
         _session(),
         *_recon(tools=[{"name": "fetch_url"}, {"name": "search"}]),
         *_cat("breadth", "LLM01", "Prompt injection"),
@@ -281,7 +281,7 @@ def mode_full() -> list[EventPair]:
     """Kitchen sink: notes, recon findings, refusals, breach, strategy error, report."""
     return _pairs(
         _note("tui-test mode=full"),
-        _note("https://platform.respan.ai/platform/red/assessments?assessment=demo-1"),
+        _note("https://platform.respan.ai/platform/red/campaigns?campaign=demo-1"),
         _session(),
         *_recon(
             guardrail="low",

@@ -211,10 +211,10 @@ def test_required_rejects_malformed_remote_operations():
 def test_campaign_url_maps_hosted_api_to_web_console():
     assert _campaign_url(
         "wss://api.respan.ai/redteam/remote/", "a1b2"
-    ) == "https://platform.respan.ai/platform/red/assessments?assessment=a1b2"
+    ) == "https://platform.respan.ai/platform/red/campaigns?campaign=a1b2"
     assert _campaign_url(
         "wss://endpoint.respan.ai/redteam/remote/", "a1b2"
-    ) == "https://enterprise.respan.ai/platform/red/assessments?assessment=a1b2"
+    ) == "https://enterprise.respan.ai/platform/red/campaigns?campaign=a1b2"
 
 
 def test_campaign_url_falls_back_to_same_origin_for_unmapped_hosts():
