@@ -28,22 +28,25 @@ import importlib.util
 import inspect
 import io
 import json
-import re
 import os
 import shlex
 import subprocess
 from pathlib import Path
 import sys
 import traceback
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
-from rich.console import Console
 from rich.text import Text
-from rich.theme import Theme
 from dotenv import find_dotenv, load_dotenv
 
 from . import DEFAULT_BUDGET, run_campaign
 from .config import BudgetConfig, EngineConfig, LLMConfig
+from .tui import (
+    THEME as _CLI_THEME,
+    _Progress,
+    _console,
+    _print_report,
+)
 from .credentials import (
     CredentialStoreUnavailable,
     delete_api_key,
@@ -75,47 +78,7 @@ try:
     from importlib.metadata import version
     __version__ = version("respan-redteam")
 except Exception:  # package metadata is optional in a source checkout
-    __version__ = "0.1.3"
-
-# Minimal theme for errors / progress (honours NO_COLOR / FORCE_COLOR via rich).
-_CLI_THEME = Theme({
-    "text": "#d4d4d4",
-    "dim": "#737373",
-    "bad": "#c47070",
-    "warn": "#b8954a",
-    "good": "#6f9f78",
-})
-
-
-def _console(*, stderr: bool = False, **kwargs) -> Console:
-    """Console with the CLI theme; honours NO_COLOR / FORCE_COLOR via rich."""
-    return Console(theme=_CLI_THEME, stderr=stderr, **kwargs)
-
-
-def _clip(text: str, limit: int = 100) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def _format_strategy_error(raw: str) -> str:
-    """One readable line for strategy.error events (no raw JSON blobs)."""
-    text = str(raw)
-    low = text.lower()
-    if "401" in text and ("invalid_api_key" in low or "incorrect api key" in low):
-        return "attacker model auth failed (401) — check OPENAI_API_KEY"
-    if "429" in text or "rate_limit" in low or "insufficient_quota" in low:
-        return "attacker model rate limited — check quota or retry later"
-    m = re.search(r"""['"]message['"]\s*:\s*['"]([^'"]+)['"]""", text)
-    if m:
-        return _clip(m.group(1), 90)
-    m = re.search(r"Error code: \d+\s*[-—]\s*(.+)", text)
-    if m:
-        tail = m.group(1).strip()
-        if tail.startswith("{") and (msg := re.search(r"""['"]message['"]\s*:\s*['"]([^'"]+)['"]""", tail)):
-            return _clip(msg.group(1), 90)
-        return _clip(tail, 90)
-    return _clip(text, 100)
-
+    __version__ = "0.1.4"
 
 def _server_to_ws_url(server: str) -> str:
     """Accept a friendly HTTP origin or the legacy full WebSocket endpoint."""
@@ -132,99 +95,6 @@ def _server_to_ws_url(server: str) -> str:
         raise ValueError("server must be an http(s) or ws(s) URL")
     scheme = "wss" if parsed.scheme == "https" else "ws"
     return urlunsplit((scheme, parsed.netloc, "/redteam/remote/", "", ""))
-
-
-class _Progress:
-    """Print every campaign event to stderr. No live bar; stdout stays free for the report."""
-
-    def __init__(self, console: Console | None = None, quiet: bool = False,
-                 probe_cap: int | None = None):
-        self.console = console if console is not None else _console(stderr=True)
-        self.quiet = quiet
-        self.probe_cap = probe_cap
-        self.probes = self.breaches = self.findings = self.refused = 0
-        self._technique = "?"
-
-    def line(self, text: str) -> None:
-        if not self.quiet:
-            self.console.print(text, soft_wrap=True, highlight=False)
-
-    def note(self, text: str) -> None:
-        """CLI-level status (connection, retries) — shown unless quiet."""
-        self.line(f"note: {text}")
-
-    def sink(self, event: str, data: dict) -> None:
-        if self.quiet:
-            return
-        if event == "session.start":
-            self.line(f"session.start  target={data.get('target', '?')}")
-        elif event == "recon.probe.sent":
-            self.line(
-                f"recon.probe.sent  name={data.get('name', '?')}"
-                f"  kind={data.get('kind', '?')}"
-            )
-        elif event == "recon.profile.ready":
-            tools = ", ".join(x.get("name", "") for x in (data.get("detected_tools") or []))
-            extra = f"  tools={tools}" if tools else ""
-            self.line(
-                f"recon.profile.ready  type={data.get('target_type', '?')}"
-                f"  guardrail={data.get('guardrail_strength', '?')}"
-                f"  extract={data.get('extraction_confidence', 0)}{extra}"
-            )
-        elif event == "category.start":
-            goal = data.get("goal") or ""
-            extra = f"  goal={goal}" if goal else ""
-            self.line(
-                f"category.start  phase={data.get('phase', '')}"
-                f"  category={data.get('category', '')}{extra}"
-            )
-        elif event == "strategy.start":
-            self.line(
-                f"strategy.start  category={data.get('category', '')}"
-                f"  strategy={data.get('strategy', '')}"
-            )
-        elif event == "strategy.error":
-            self.line(
-                f"strategy.error  strategy={data.get('strategy', '?')}"
-                f"  error={_format_strategy_error(data.get('error', '?'))}"
-            )
-        elif event == "attack.attempt":
-            self._technique = data.get("technique", "?")
-            self.line(f"attack.attempt  technique={self._technique}")
-        elif event == "target.response":
-            if data.get("probes_used") is not None:
-                self.probes = data["probes_used"]
-            cap = f"/{self.probe_cap}" if self.probe_cap else ""
-            snippet = " ".join(str(data.get("snippet") or "").split())
-            if len(snippet) > 80:
-                snippet = snippet[:79] + "…"
-            extra = f"  snippet={snippet}" if snippet else ""
-            self.line(f"target.response  probes={self.probes}{cap}{extra}")
-        elif event == "judge.verdict":
-            outcome = data.get("outcome", "")
-            if outcome == "success":
-                self.breaches += 1
-            elif outcome == "refused":
-                self.refused += 1
-            self.line(f"judge.verdict  technique={self._technique}  outcome={outcome}")
-        elif event == "finding.critical":
-            self.findings += 1
-            self.line(
-                f"finding.critical  severity={data.get('severity', '?')}"
-                f"  title={data.get('title', '')}"
-            )
-        elif event == "report.ready":
-            self.line(
-                f"report.ready  grade={data.get('grade', '?')}"
-                f"  score={data.get('score', '?')}"
-                f"  findings={data.get('findings', 0)}"
-                f"  probes={data.get('probes', '?')}"
-            )
-        else:
-            self.line(f"{event}  {data}")
-
-    def close(self) -> None:
-        pass
 
 
 # --- remote adapter loading + WebSocket client -------------------------------
@@ -385,15 +255,29 @@ def _required(msg: dict, *fields: str) -> None:
         raise RuntimeError(f"remote {msg.get('op', 'message')} omitted {', '.join(missing)}")
 
 
+# Hosted API host -> web-console assessment URL ({id} is the assessment id).
+_CONSOLE_URLS = {
+    "api.respan.ai": "https://platform.respan.ai/platform/red/assessments?assessment={id}",
+    "endpoint.respan.ai": "https://enterprise.respan.ai/platform/red/assessments?assessment={id}",
+}
+
+
 def _campaign_url(ws_url: str, campaign_id: str) -> str:
-    """Build the UI URL from a WebSocket endpoint without retaining its route path."""
+    """The web-console URL for a running assessment.
+
+    A hosted API host maps to its console front-end; anything else (self-hosted, local
+    dev, the legacy redteam.respan.ai) falls back to a same-origin /campaign/{id} link."""
     parsed = urlsplit(ws_url)
+    template = _CONSOLE_URLS.get((parsed.hostname or "").lower())
+    if template:
+        return template.format(id=quote(str(campaign_id), safe=""))
     scheme = "https" if parsed.scheme == "wss" else "http"
     origin = urlunsplit((scheme, parsed.netloc, "", "", ""))
     return f"{origin}/campaign/{campaign_id}"
 
 
-def _write_report(report: dict, output_format: str, output: str | None = None) -> None:
+def _write_report(report: dict, output_format: str, output: str | None = None,
+                  *, console_url: str | None = None) -> None:
     """Write exactly one report to stdout or a file; progress always remains on stderr. A
     completed campaign's data is never lost to a rendering bug: the text report is dry-run
     against a throwaway buffer first, falling back to plain JSON if that raises."""
@@ -409,7 +293,8 @@ def _write_report(report: dict, output_format: str, output: str | None = None) -
             destination.write("\n")
         else:
             try:
-                _print_report(report, _console(file=io.StringIO(), force_terminal=False))
+                _print_report(report, _console(file=io.StringIO(), force_terminal=False),
+                              console_url=console_url)
             except Exception as exc:  # noqa: BLE001 -- the campaign result matters more than the format
                 print(f"warning: could not render the text report ({type(exc).__name__}: {exc});"
                      f" writing JSON instead", file=sys.stderr)
@@ -417,7 +302,8 @@ def _write_report(report: dict, output_format: str, output: str | None = None) -
                 destination.write("\n")
             else:
                 _print_report(report, _console(file=destination,
-                                               force_terminal=False if stream else None))
+                                               force_terminal=False if stream else None),
+                              console_url=console_url)
     finally:
         if stream is not None:
             stream.close()
@@ -431,6 +317,7 @@ async def _run_remote(ws_url: str, api_key: str, target, output_format: str, out
 
     ws = await _connect(ws_url, api_key, retries, connect_timeout, prog)
     report, status, chats = None, "?", {}
+    console_url: str | None = None
     done_msg: dict = {}
     try:
         await ws.send(json.dumps({"op": "hello",
@@ -446,7 +333,8 @@ async def _run_remote(ws_url: str, api_key: str, target, output_format: str, out
             if op == "ready":
                 _required(msg, "campaign_id")
                 cid = msg.get("campaign_id")
-                prog.note(f"campaign running · progress at {_campaign_url(ws_url, str(cid))}")
+                console_url = _campaign_url(ws_url, str(cid))
+                prog.note(console_url)
             elif op == "open":
                 _required(msg, "id", "chat_id")
                 try:
@@ -496,7 +384,7 @@ async def _run_remote(ws_url: str, api_key: str, target, output_format: str, out
         print(f"error: campaign ended without a report (status={status}{detail})", file=sys.stderr)
         return 1
     try:
-        _write_report(report, output_format, output)
+        _write_report(report, output_format, output, console_url=console_url)
     except OSError as exc:
         print(f"error: could not write report: {exc}", file=sys.stderr)
         return 1
@@ -511,64 +399,6 @@ def _grade_exit_code(grade: str, fail_under: str | None) -> int:
     if fail_under and _GRADE_RANK.get(grade, 0) < _GRADE_RANK.get(fail_under, 5):
         return 4
     return 0
-
-
-def _print_report(r: dict, console: Console) -> None:
-    """Print the graded report as plain key=value lines."""
-    findings = r.get("findings") or []
-    findings_count = r.get("findings_count", len(findings))
-    sev = r.get("severity_counts") or {}
-    console.print(
-        f"target={r.get('target_label', '?')}"
-        f"  grade={r.get('grade', '?')}"
-        f"  score={r.get('score', '?')}"
-        f"  resistance={round((r.get('resistance_rate') or 0) * 100)}%"
-        f"  findings={findings_count}"
-        f"  probes={r.get('probes_sent', '?')}/{r.get('probes_total', '?')}"
-        f"  cost=${r.get('cost_usd', '?')}"
-        f"  duration={r.get('duration_s', '?')}s",
-        highlight=False,
-    )
-    console.print(
-        f"severity  critical={sev.get('critical', 0)}"
-        f"  high={sev.get('high', 0)}"
-        f"  medium={sev.get('medium', 0)}"
-        f"  low={sev.get('low', 0)}",
-        highlight=False,
-    )
-    if not findings:
-        console.print("finding  (none)", highlight=False)
-    for f in findings:
-        evidence = _clip(f.get("evidence_span") or "", 100)
-        parts = [
-            f"finding  severity={f.get('severity', '?')}",
-            f"title={f.get('title', '')}",
-            f"category={f.get('category', '')}",
-        ]
-        if f.get("technique"):
-            parts.append(f"technique={f['technique']}")
-        if f.get("owasp"):
-            parts.append(f"owasp={f['owasp']}")
-        if f.get("atlas"):
-            parts.append(f"atlas={f['atlas']}")
-        if evidence:
-            parts.append(f"evidence={evidence}")
-        console.print("  ".join(parts), highlight=False)
-    for t in sorted(r.get("category_tiles") or [], key=lambda x: x["category"]):
-        if t.get("gateway_only"):
-            console.print(
-                f"category  id={t['category']}  name={t['name']}  access=gateway-only",
-                highlight=False,
-            )
-        else:
-            console.print(
-                f"category  id={t['category']}  name={t['name']}"
-                f"  grade={t.get('sub_grade', '?')}"
-                f"  findings={t.get('findings', 0)}"
-                f"  probes={t.get('probes_used', 0)}"
-                f"  access=black-box",
-                highlight=False,
-            )
 
 
 async def _validate_api_key(ws_url: str, api_key: str) -> None:
@@ -894,7 +724,6 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
 
     # --- REMOTE scan (default): engine on the server, your agent on this machine (over WebSocket) ---
     if not args.local:
-        prog.note(f"scan · {getattr(target, 'label', 'target')} → {args.ws_url}")
         try:
             return asyncio.run(_run_remote(
                 args.ws_url, args.api_key, target, args.format, args.output, args.retries,
@@ -902,8 +731,8 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
                 prog, args.fail_under,
             ))
         except KeyboardInterrupt:
-            prog.close()
-            print("\ninterrupted", file=sys.stderr)
+            prog.close(interrupted=True)
+            print("interrupted", file=sys.stderr)
             return 130
         except Exception as exc:  # noqa: BLE001 -- connect exhausted / unexpected: no traceback
             prog.close()
@@ -917,8 +746,8 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
     try:
         result = run_campaign(target, config=local_config, sink=prog.sink)
     except KeyboardInterrupt:
-        prog.close()
-        print("\ninterrupted", file=sys.stderr)
+        prog.close(interrupted=True)
+        print("interrupted", file=sys.stderr)
         return 130
     except Exception as exc:  # noqa: BLE001 -- CLI failures should not dump a traceback
         prog.close()

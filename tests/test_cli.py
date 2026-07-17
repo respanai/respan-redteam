@@ -64,14 +64,14 @@ def test_progress_prints_every_event():
         p.sink(e, d)
     p.close()
     out = buf.getvalue()
-    assert "session.start  target=acme" in out
-    assert "recon.profile.ready" in out and "tools=fetch_url" in out
-    assert "category.start  phase=breadth  category=LLM07" in out
-    assert "attack.attempt  technique=seed:direct" in out
-    assert "judge.verdict  technique=seed:direct  outcome=refused" in out
-    assert "judge.verdict  technique=seed:roleplay  outcome=success" in out
-    assert "finding.critical  severity=critical  title=Secret" in out
-    assert "report.ready  grade=F  score=40  findings=1  probes=12" in out
+    # Off a TTY the dashboard degrades to durable milestones only — never per-probe
+    # spam — while every counter is still tracked internally.
+    assert "respan" in out and "acme" in out              # session banner
+    assert "guardrail high" in out and "fetch_url" in out  # recon profile + tools
+    assert "LLM07" in out                                 # category milestone
+    assert "seed:direct" not in out                        # transient probe detail is not logged
+    assert "Secret" in out and "critical" in out           # finding milestone
+    assert "grade F" in out and "score 40" in out          # closing summary
     assert p.probes == 5 and p.breaches == 1 and p.findings == 1 and p.refused == 1
 
 
@@ -98,6 +98,28 @@ def test_strategy_error_is_readable():
     assert "OPENAI_API_KEY" in out
     assert "Incorrect API key provided" not in out
     assert "invalid_api_key" not in out
+
+
+def test_progress_interrupted_close_clears_and_shows_cursor():
+    """Ctrl-C teardown must wipe the live region and un-hide the cursor."""
+    buf = io.StringIO()
+    # force_terminal alone still leaves TERM=dumb as a "dumb" console; give it a
+    # real TERM so the live-dashboard path (and interrupt reset) engages.
+    with patch.dict(os.environ, {"TERM": "xterm-256color"}):
+        console = Console(
+            file=buf,
+            force_terminal=True,
+            color_system="standard",
+            width=100,
+            theme=_CLI_THEME,
+        )
+        p = _Progress(console=console)
+        assert p._tty
+        p._ensure_live()
+        p.close(interrupted=True)
+    out = buf.getvalue()
+    assert "\x1b[?25h" in out  # show cursor
+    assert "\x1b[H" in out and "\x1b[2J" in out  # home + clear screen
 
 
 def _write_adapter(body: str) -> str:
@@ -185,7 +207,16 @@ def test_required_rejects_malformed_remote_operations():
         assert "chat_id" in str(exc) and "message" in str(exc)
 
 
-def test_campaign_url_discards_websocket_route():
+def test_campaign_url_maps_hosted_api_to_web_console():
+    assert _campaign_url(
+        "wss://api.respan.ai/redteam/remote/", "a1b2"
+    ) == "https://platform.respan.ai/platform/red/assessments?assessment=a1b2"
+    assert _campaign_url(
+        "wss://endpoint.respan.ai/redteam/remote/", "a1b2"
+    ) == "https://enterprise.respan.ai/platform/red/assessments?assessment=a1b2"
+
+
+def test_campaign_url_falls_back_to_same_origin_for_unmapped_hosts():
     assert _campaign_url(
         "wss://redteam.respan.ai/redteam/remote/", "campaign-1"
     ) == "https://redteam.respan.ai/campaign/campaign-1"
@@ -352,7 +383,19 @@ def test_tui_test_lists_modes_and_replays_errors():
     with redirect_stdout(out), redirect_stderr(err):
         assert tui_test_main(["errors", "--fast", "--no-report"]) == 0
     assert "OPENAI_API_KEY" in err.getvalue()
-    assert "strategy.error" in err.getvalue()
+    assert "strategy" in err.getvalue()
+
+
+def test_tui_test_keyboard_interrupt_resets_and_exits_130():
+    from respan_redteam.tui_test import run_tui_test
+
+    err = io.StringIO()
+    with redirect_stderr(err), patch("respan_redteam.tui_test._Progress") as ProgressCls:
+        prog = ProgressCls.return_value
+        prog.sink.side_effect = KeyboardInterrupt
+        assert run_tui_test("ok", paced=False, write_report=False) == 130
+        prog.close.assert_called_once_with(interrupted=True)
+    assert "interrupted" in err.getvalue()
 
 
 def test_tui_test_unknown_mode_fails():
