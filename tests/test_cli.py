@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
-from respan_redteam.cli import (_Progress, _auth_main, _build_local_engine_config, _campaign_url,
+from respan_redteam.cli import (_Progress, _CLI_THEME, _auth_main, _build_local_engine_config, _campaign_url,
                                 _connect, _error, _explain,
                                 _load_adapter, _open_adapter, _required,
                                 _retryable_connection_error, _scan_main, _server_to_ws_url,
@@ -26,20 +26,18 @@ from respan_redteam.credentials import (
 from respan_redteam.user_config import ProfileConfig
 
 
-def _progress(buf, *, terminal: bool, quiet: bool = False) -> _Progress:
-    """A _Progress whose rich Console writes to `buf`; `terminal` picks the colour + live-counter
-    path (a StringIO is never a real TTY, so we force it)."""
-    if terminal:
-        console = Console(
-            file=buf,
-            force_terminal=True,
-            no_color=False,
-            color_system="standard",
-            width=100,
-        )
-    else:
-        console = Console(file=buf, force_terminal=False, width=100)
-    return _Progress(console=console, quiet=quiet)
+def _progress(buf, *, terminal: bool = False, quiet: bool = False,
+              probe_cap: int | None = None) -> _Progress:
+    """A _Progress whose rich Console writes to `buf`."""
+    console = Console(
+        file=buf,
+        force_terminal=terminal,
+        no_color=not terminal,
+        color_system="standard" if terminal else None,
+        width=100,
+        theme=_CLI_THEME,
+    )
+    return _Progress(console=console, quiet=quiet, probe_cap=probe_cap)
 
 
 _EVENTS = [
@@ -47,9 +45,8 @@ _EVENTS = [
     ("recon.profile.ready", {"target_type": "agent", "guardrail_strength": "high",
                              "extraction_confidence": 0.5, "detected_tools": [{"name": "fetch_url"}]}),
     ("category.start", {"phase": "breadth", "category": "LLM07", "goal": "leak"}),
-    # attack.attempt carries the technique; the following verdict no longer repeats it.
     ("attack.attempt", {"technique": "seed:direct", "prompt": "hi"}),
-    ("target.response", {"probes_used": 5}),
+    ("target.response", {"probes_used": 5, "snippet": "no"}),
     ("judge.verdict", {"outcome": "refused"}),
     ("attack.attempt", {"technique": "seed:roleplay", "prompt": "hi"}),
     ("judge.verdict", {"outcome": "success"}),
@@ -60,39 +57,47 @@ _EVENTS = [
 DEFAULT_URL = "wss://redteam.respan.ai/redteam/remote/"
 
 
-def test_nontty_logs_every_verdict_and_no_escapes():
+def test_progress_prints_every_event():
     buf = io.StringIO()
-    p = _progress(buf, terminal=False)        # not a terminal -> plain text, no live counter
+    p = _progress(buf, probe_cap=12)
     for e, d in _EVENTS:
         p.sink(e, d)
     p.close()
     out = buf.getvalue()
-    assert "\x1b[" not in out                 # rich emits no ANSI when not a terminal
-    assert "seed:direct  refused" in out      # refusals ARE logged when piped
-    assert "BREACH" in out and "★ FINDING" in out
-    assert "✔ complete · grade F" in out
-
-
-def test_tty_keeps_counters_and_suppresses_refusals():
-    buf = io.StringIO()
-    p = _progress(buf, terminal=True)         # a terminal -> colour + a live in-place counter
-    for e, d in _EVENTS:
-        p.sink(e, d)
-    out = buf.getvalue()
-    p.close()
+    assert "session.start  target=acme" in out
+    assert "recon.profile.ready" in out and "tools=fetch_url" in out
+    assert "category.start  phase=breadth  category=LLM07" in out
+    assert "attack.attempt  technique=seed:direct" in out
+    assert "judge.verdict  technique=seed:direct  outcome=refused" in out
+    assert "judge.verdict  technique=seed:roleplay  outcome=success" in out
+    assert "finding.critical  severity=critical  title=Secret" in out
+    assert "report.ready  grade=F  score=40  findings=1  probes=12" in out
     assert p.probes == 5 and p.breaches == 1 and p.findings == 1 and p.refused == 1
-    assert "\x1b[" in out                       # ANSI on a terminal
-    assert "BREACH" in out                      # a breach scrolls its own line...
-    assert "seed:direct  refused" not in out    # ...a refusal only rides the live counter
 
 
 def test_quiet_emits_nothing():
     buf = io.StringIO()
-    p = _progress(buf, terminal=True, quiet=True)
+    p = _progress(buf, quiet=True)
     for e, d in _EVENTS:
         p.sink(e, d)
     p.close()
     assert buf.getvalue() == ""
+
+
+def test_strategy_error_is_readable():
+    buf = io.StringIO()
+    p = _progress(buf)
+    raw = (
+        "completion failed for gpt-4.1: Error code: 401 - "
+        "{'error': {'message': 'Incorrect API key provided: not-required', "
+        "'type': 'invalid_request_error', 'code': 'invalid_api_key'}}"
+    )
+    p.sink("strategy.error", {"strategy": "crescendo", "error": raw})
+    p.close()
+    out = buf.getvalue()
+    assert "OPENAI_API_KEY" in out
+    assert "Incorrect API key provided" not in out
+    assert "invalid_api_key" not in out
 
 
 def _write_adapter(body: str) -> str:
@@ -325,7 +330,48 @@ def test_main_without_arguments_prints_short_command_help():
         assert cli_main([]) == 0
     text = output.getvalue()
     assert "scan" in text and "auth" in text
+    assert "tui-test" in text
     assert "--adapter-timeout" not in text
+
+
+def test_tui_test_lists_modes_and_replays_errors():
+    from respan_redteam.tui_test import main as tui_test_main, events_for, MODES
+
+    assert set(MODES) >= {"ok", "errors", "breach", "full", "rate-limit"}
+    listed = io.StringIO()
+    with redirect_stdout(listed):
+        assert tui_test_main(["--list"]) == 0
+    assert "errors" in listed.getvalue() and "rate-limit" in listed.getvalue()
+
+    names = [name for name, _ in events_for("errors") if name != "__note__"]
+    assert "strategy.error" in names
+    assert "report.ready" in names
+
+    out = io.StringIO()
+    err = io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        assert tui_test_main(["errors", "--fast", "--no-report"]) == 0
+    assert "OPENAI_API_KEY" in err.getvalue()
+    assert "strategy.error" in err.getvalue()
+
+
+def test_tui_test_unknown_mode_fails():
+    from respan_redteam.tui_test import main as tui_test_main
+
+    err = io.StringIO()
+    with redirect_stderr(err):
+        try:
+            tui_test_main(["not-a-mode", "--fast"])
+            assert False, "expected unknown mode to fail"
+        except SystemExit as exc:
+            assert exc.code == 2
+    assert "unknown tui-test mode" in err.getvalue()
+
+
+def test_tui_test_routed_from_root():
+    with patch("respan_redteam.tui_test.main", return_value=0) as tui:
+        assert cli_main(["tui-test", "ok", "--no-report"]) == 0
+        tui.assert_called_once_with(["ok", "--no-report"])
 
 
 def test_scan_accepts_server_origin_and_runs_remote_adapter():

@@ -14,9 +14,9 @@ Point the engine at YOUR OWN agent via an adapter.py — a Target with `open() -
 
 Adapter examples are available at https://github.com/respanai/respan-redteam/tree/main/examples.
 
-Progress + report render via rich (colour on a TTY; honours NO_COLOR / FORCE_COLOR). Progress
-streams to stderr with a live counter; the report is written to stdout, so `... > report.json`
-stays clean. Exit codes: 0 ok, 1 no report, 2 bad target/connect, 3 lost connection mid-campaign,
+Progress streams every campaign event to stderr; the report is written to stdout, so
+`... > report.json` stays clean. rich handles colour on a TTY (honours NO_COLOR / FORCE_COLOR).
+Exit codes: 0 ok, 1 no report, 2 bad target/connect, 3 lost connection mid-campaign,
 4 grade below --fail-under, 130 interrupted.
 """
 from __future__ import annotations
@@ -26,7 +26,9 @@ import asyncio
 import getpass
 import importlib.util
 import inspect
+import io
 import json
+import re
 import os
 import shlex
 import subprocess
@@ -35,11 +37,9 @@ import sys
 import traceback
 from urllib.parse import urlsplit, urlunsplit
 
-from rich import box
 from rich.console import Console
-from rich.live import Live
-from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 from dotenv import find_dotenv, load_dotenv
 
 from . import DEFAULT_BUDGET, run_campaign
@@ -51,6 +51,7 @@ from .credentials import (
     resolve_api_key,
     save_api_key,
 )
+from .model_client import TransientLLMError
 from .user_config import (
     ProfileConfig,
     UserConfigError,
@@ -76,11 +77,44 @@ try:
 except Exception:  # package metadata is optional in a source checkout
     __version__ = "0.1.3"
 
-# rich styles (rich itself handles terminal detection, NO_COLOR, and FORCE_COLOR).
-_GRADE_STYLE = {"A": "bold green", "B": "green", "C": "bold yellow",
-                "D": "red", "F": "bold red", "n/a": "dim"}
-_SEV_STYLE = {"critical": "bold red", "high": "red", "medium": "yellow", "low": "dim"}
-_VERDICT_ICON = {"success": "✓", "partial": "~", "refused": "·", "error": "!"}
+# Minimal theme for errors / progress (honours NO_COLOR / FORCE_COLOR via rich).
+_CLI_THEME = Theme({
+    "text": "#d4d4d4",
+    "dim": "#737373",
+    "bad": "#c47070",
+    "warn": "#b8954a",
+    "good": "#6f9f78",
+})
+
+
+def _console(*, stderr: bool = False, **kwargs) -> Console:
+    """Console with the CLI theme; honours NO_COLOR / FORCE_COLOR via rich."""
+    return Console(theme=_CLI_THEME, stderr=stderr, **kwargs)
+
+
+def _clip(text: str, limit: int = 100) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _format_strategy_error(raw: str) -> str:
+    """One readable line for strategy.error events (no raw JSON blobs)."""
+    text = str(raw)
+    low = text.lower()
+    if "401" in text and ("invalid_api_key" in low or "incorrect api key" in low):
+        return "attacker model auth failed (401) — check OPENAI_API_KEY"
+    if "429" in text or "rate_limit" in low or "insufficient_quota" in low:
+        return "attacker model rate limited — check quota or retry later"
+    m = re.search(r"""['"]message['"]\s*:\s*['"]([^'"]+)['"]""", text)
+    if m:
+        return _clip(m.group(1), 90)
+    m = re.search(r"Error code: \d+\s*[-—]\s*(.+)", text)
+    if m:
+        tail = m.group(1).strip()
+        if tail.startswith("{") and (msg := re.search(r"""['"]message['"]\s*:\s*['"]([^'"]+)['"]""", tail)):
+            return _clip(msg.group(1), 90)
+        return _clip(tail, 90)
+    return _clip(text, 100)
 
 
 def _server_to_ws_url(server: str) -> str:
@@ -101,110 +135,96 @@ def _server_to_ws_url(server: str) -> str:
 
 
 class _Progress:
-    """Stream campaign progress to stderr via rich so stdout stays a clean report. Scrolling lines
-    for phases/breaches/findings; on a terminal a one-line live counter tracks probes/breaches/
-    refused/findings in place (refusals stay quiet). Piped, every verdict is logged for CI. rich
-    handles terminal detection, NO_COLOR and FORCE_COLOR."""
+    """Print every campaign event to stderr. No live bar; stdout stays free for the report."""
 
     def __init__(self, console: Console | None = None, quiet: bool = False,
                  probe_cap: int | None = None):
-        self.console = console if console is not None else Console(stderr=True)
+        self.console = console if console is not None else _console(stderr=True)
         self.quiet = quiet
         self.probe_cap = probe_cap
         self.probes = self.breaches = self.findings = self.refused = 0
-        self.phase = "starting"
-        self._technique = "?"      # tracked from attack.attempt; labels the following verdict
-        self._live: Live | None = None
+        self._technique = "?"
 
-    def _status(self) -> Text:
-        cap = f"/{self.probe_cap}" if self.probe_cap else ""
-        t = Text("  ")
-        t.append(self.phase, style="bold cyan")
-        t.append(f" · probes {self.probes}{cap} · breaches ")
-        t.append(str(self.breaches), style="bold yellow")
-        t.append(f" · refused {self.refused} · findings ")
-        t.append(str(self.findings), style="bold red")
-        return t
-
-    def _ensure_live(self) -> None:
-        # a live in-place counter, only on an interactive terminal
-        if self._live is None and not self.quiet and self.console.is_terminal:
-            self._live = Live(self._status(), console=self.console,
-                              transient=True, auto_refresh=False)
-            self._live.start()
-
-    def _refresh(self) -> None:
-        if self._live is not None:
-            self._live.update(self._status(), refresh=True)
-
-    def line(self, renderable) -> None:
+    def line(self, text: str) -> None:
         if not self.quiet:
-            self.console.print(renderable, soft_wrap=True)   # rich prints above the live region
+            self.console.print(text, soft_wrap=True, highlight=False)
 
     def note(self, text: str) -> None:
-        """CLI-level status (connection, retries) — dim, shown unless quiet."""
-        self.line(Text(f"[remote] {text}", style="dim"))
+        """CLI-level status (connection, retries) — shown unless quiet."""
+        self.line(f"note: {text}")
 
     def sink(self, event: str, data: dict) -> None:
         if self.quiet:
             return
-        self._ensure_live()
         if event == "session.start":
-            self.line(Text(f"▸ target: {data.get('target', '?')}", style="bold"))
+            self.line(f"session.start  target={data.get('target', '?')}")
         elif event == "recon.probe.sent":
-            self.phase = "recon"
-            self._refresh()
+            self.line(
+                f"recon.probe.sent  name={data.get('name', '?')}"
+                f"  kind={data.get('kind', '?')}"
+            )
         elif event == "recon.profile.ready":
-            tools = ", ".join(t.get("name", "") for t in (data.get("detected_tools") or []))
-            self.phase = "recon done"
-            line = Text("◆ recon", style="magenta")
-            line.append(f"  type={data.get('target_type', '?')}"
-                        f"  guardrail={data.get('guardrail_strength', '?')}"
-                        f"  extract={data.get('extraction_confidence', 0)}"
-                        + (f"  tools=[{tools}]" if tools else ""))
-            self.line(line)
+            tools = ", ".join(x.get("name", "") for x in (data.get("detected_tools") or []))
+            extra = f"  tools={tools}" if tools else ""
+            self.line(
+                f"recon.profile.ready  type={data.get('target_type', '?')}"
+                f"  guardrail={data.get('guardrail_strength', '?')}"
+                f"  extract={data.get('extraction_confidence', 0)}{extra}"
+            )
         elif event == "category.start":
-            self.phase = " ".join(x for x in (data.get("phase"), data.get("category")) if x)
-            label = " · ".join(x for x in (data.get("phase"), data.get("category"),
-                                           data.get("goal")) if x)
-            self.line(Text(f"▸ {label}", style="bold cyan"))
+            goal = data.get("goal") or ""
+            extra = f"  goal={goal}" if goal else ""
+            self.line(
+                f"category.start  phase={data.get('phase', '')}"
+                f"  category={data.get('category', '')}{extra}"
+            )
         elif event == "strategy.start":
-            self.line(Text(f"  → {data.get('strategy', '')}", style="dim"))
+            self.line(
+                f"strategy.start  category={data.get('category', '')}"
+                f"  strategy={data.get('strategy', '')}"
+            )
+        elif event == "strategy.error":
+            self.line(
+                f"strategy.error  strategy={data.get('strategy', '?')}"
+                f"  error={_format_strategy_error(data.get('error', '?'))}"
+            )
         elif event == "attack.attempt":
-            self._technique = data.get("technique", "?")   # remembered for the following verdict
+            self._technique = data.get("technique", "?")
+            self.line(f"attack.attempt  technique={self._technique}")
         elif event == "target.response":
             if data.get("probes_used") is not None:
                 self.probes = data["probes_used"]
-            self._refresh()
+            cap = f"/{self.probe_cap}" if self.probe_cap else ""
+            snippet = " ".join(str(data.get("snippet") or "").split())
+            if len(snippet) > 80:
+                snippet = snippet[:79] + "…"
+            extra = f"  snippet={snippet}" if snippet else ""
+            self.line(f"target.response  probes={self.probes}{cap}{extra}")
         elif event == "judge.verdict":
             outcome = data.get("outcome", "")
-            tech = self._technique
-            icon = _VERDICT_ICON.get(outcome, "·")
             if outcome == "success":
                 self.breaches += 1
-                self.line(Text(f"  {icon} {tech}  BREACH", style="bold yellow"))
-            else:
-                if outcome == "refused":
-                    self.refused += 1
-                if self._live is not None:
-                    self._refresh()          # the live counter carries refusals
-                else:
-                    self.line(Text(f"  {icon} {tech}  {outcome}", style="dim"))   # piped: full log
+            elif outcome == "refused":
+                self.refused += 1
+            self.line(f"judge.verdict  technique={self._technique}  outcome={outcome}")
         elif event == "finding.critical":
             self.findings += 1
-            self.line(Text(f"★ FINDING [{data.get('severity', '?')}] {data.get('title', '')}",
-                           style="bold red"))
+            self.line(
+                f"finding.critical  severity={data.get('severity', '?')}"
+                f"  title={data.get('title', '')}"
+            )
         elif event == "report.ready":
-            self.phase = "done"
-            self.line(Text(f"✔ complete · grade {data.get('grade', '?')}"
-                           f" · score {data.get('score', '?')}/100"
-                           f" · {data.get('findings', 0)} findings"
-                           f" · {data.get('probes', '?')} probes", style="bold green"))
+            self.line(
+                f"report.ready  grade={data.get('grade', '?')}"
+                f"  score={data.get('score', '?')}"
+                f"  findings={data.get('findings', 0)}"
+                f"  probes={data.get('probes', '?')}"
+            )
+        else:
+            self.line(f"{event}  {data}")
 
     def close(self) -> None:
-        if self._live is not None:
-            self._live.stop()
-            self._live = None
+        pass
 
 
 # --- remote adapter loading + WebSocket client -------------------------------
@@ -246,7 +266,7 @@ def _load_adapter(path: str, symbol: str | None = None):
 
 
 def _explain(exc: BaseException) -> str:
-    """Human-readable one-liner for a connection failure (no traceback)."""
+    """Human-readable one-liner for a connection or engine failure (no traceback)."""
     import websockets.exceptions as we
     if isinstance(exc, we.InvalidStatus):
         status = getattr(exc.response, "status_code", "?")
@@ -261,6 +281,13 @@ def _explain(exc: BaseException) -> str:
         return "timed out reaching the engine"
     if isinstance(exc, OSError):
         return f"network error ({exc})"
+    if isinstance(exc, TransientLLMError):
+        msg = str(exc)
+        if "401" in msg or "invalid_api_key" in msg or "AuthenticationError" in msg:
+            return "the OpenAI API rejected the key (401) — check OPENAI_API_KEY"
+        if "429" in msg or "insufficient_quota" in msg:
+            return "the OpenAI API is rate-limiting or out of quota — check your plan/usage"
+        return f"the attacker/judge model failed repeatedly ({msg})"
     if isinstance(exc, (ValueError, RuntimeError)):
         return str(exc)
     return f"{type(exc).__name__}: {exc}"
@@ -268,12 +295,21 @@ def _explain(exc: BaseException) -> str:
 
 def _error(title: str, exc: BaseException | None = None, *, hint: str | None = None,
            debug: bool = False) -> None:
-    """Consistent, actionable stderr output with tracebacks only when requested."""
+    """Consistent, actionable stderr output with tracebacks only when requested (`--debug` or
+    RESPAN_REDTEAM_DEBUG=1, so the top-level safety net can opt in without threading args
+    through)."""
+    console = _console(stderr=True)
+    line = Text("error: ", style="bad")
+    line.append(title)
     detail = _explain(exc) if exc is not None else ""
-    print(f"error: {title}{': ' + detail if detail else ''}", file=sys.stderr)
+    if detail:
+        line.append(f": {detail}")
+    console.print(line, soft_wrap=True)
     if hint:
-        print(f"hint: {hint}", file=sys.stderr)
-    if debug and exc is not None:
+        hint_line = Text("hint: ", style="bold dim")
+        hint_line.append(hint, style="dim")
+        console.print(hint_line, soft_wrap=True)
+    if exc is not None and (debug or os.environ.get("RESPAN_REDTEAM_DEBUG")):
         traceback.print_exception(exc, file=sys.stderr)
 
 
@@ -358,7 +394,9 @@ def _campaign_url(ws_url: str, campaign_id: str) -> str:
 
 
 def _write_report(report: dict, output_format: str, output: str | None = None) -> None:
-    """Write exactly one report to stdout or a file; progress always remains on stderr."""
+    """Write exactly one report to stdout or a file; progress always remains on stderr. A
+    completed campaign's data is never lost to a rendering bug: the text report is dry-run
+    against a throwaway buffer first, falling back to plain JSON if that raises."""
     stream = None
     try:
         if output:
@@ -370,7 +408,16 @@ def _write_report(report: dict, output_format: str, output: str | None = None) -
             json.dump(report, destination, indent=2)
             destination.write("\n")
         else:
-            _print_report(report, Console(file=destination, force_terminal=False if stream else None))
+            try:
+                _print_report(report, _console(file=io.StringIO(), force_terminal=False))
+            except Exception as exc:  # noqa: BLE001 -- the campaign result matters more than the format
+                print(f"warning: could not render the text report ({type(exc).__name__}: {exc});"
+                     f" writing JSON instead", file=sys.stderr)
+                json.dump(report, destination, indent=2)
+                destination.write("\n")
+            else:
+                _print_report(report, _console(file=destination,
+                                               force_terminal=False if stream else None))
     finally:
         if stream is not None:
             stream.close()
@@ -467,59 +514,61 @@ def _grade_exit_code(grade: str, fail_under: str | None) -> int:
 
 
 def _print_report(r: dict, console: Console) -> None:
-    """Render the graded report to `console` (rich Table + styled lines). When stdout is piped
-    (`> report.txt`) rich drops colour automatically; `--json` is emitted separately."""
-    console.rule(Text(f"Respan red-team · {r['target_label']}", style="bold"))
-
-    grade = Text("Grade ")
-    grade.append(r["grade"], style=_GRADE_STYLE.get(r["grade"], ""))
-    grade.append(f"  ·  score {r['score']}/100  ·  resistance {round(r['resistance_rate'] * 100)}%")
-    console.print(grade)
-    console.print(f"Probes {r['probes_sent']}/{r['probes_total']}  ·  cost ${r['cost_usd']}"
-                  f"  ·  {r['duration_s']}s", style="dim")
-    sev = Text("Severity ")
-    counts = [(k, v) for k, v in r["severity_counts"].items() if v]
-    for i, (k, v) in enumerate(counts):
-        sev.append("  " if i else "")
-        sev.append(f"{k} {v}", style=_SEV_STYLE.get(k, ""))
-    if not counts:
-        sev.append("none", style="dim")
-    console.print(sev)
-
-    # per-category report card — the full picture, not just the breaches
-    tiles = sorted(r.get("category_tiles") or [], key=lambda t: t["category"])
-    if tiles:
-        table = Table(box=box.SIMPLE_HEAD, title="Category card", title_justify="left",
-                      title_style="bold", pad_edge=False, show_edge=False)
-        table.add_column("", justify="right")
-        table.add_column("cat", style="bold")
-        table.add_column("category")
-        table.add_column("result", style="dim")
-        for t in tiles:
-            if t.get("gateway_only"):
-                table.add_row(Text("·", style="dim"), t["category"], t["name"],
-                              Text("gateway-only — needs deeper access", style="dim"))
-            else:
-                n, p = t["findings"], t["probes_used"]
-                table.add_row(Text(t["sub_grade"], style=_GRADE_STYLE.get(t["sub_grade"], "")),
-                              t["category"], t["name"],
-                              f"{n} finding{'s' * (n != 1)} · {p} probe{'s' * (p != 1)}")
-        console.print(table)
-
-    console.print(Text(f"Findings ({r['findings_count']})", style="bold"))
-    if not r["findings"]:
-        console.print(Text("  none — target held.", style="dim"))
-    for f in r["findings"]:
-        head = Text("  ")
-        head.append(f"[{f['severity']:>8}]", style=_SEV_STYLE.get(f["severity"], ""))
-        head.append(" ")
-        head.append(f["category"], style="bold")
-        head.append("  ")
-        head.append(f["title"])                            # user content: no markup parsing (Text.append)
-        console.print(head, soft_wrap=True)
-        console.print(Text(f"    via {f['technique']}", style="dim"))
-        if f.get("evidence_span"):
-            console.print(Text(f"    “{f['evidence_span'][:120]}”", style="dim"), soft_wrap=True)
+    """Print the graded report as plain key=value lines."""
+    findings = r.get("findings") or []
+    findings_count = r.get("findings_count", len(findings))
+    sev = r.get("severity_counts") or {}
+    console.print(
+        f"target={r.get('target_label', '?')}"
+        f"  grade={r.get('grade', '?')}"
+        f"  score={r.get('score', '?')}"
+        f"  resistance={round((r.get('resistance_rate') or 0) * 100)}%"
+        f"  findings={findings_count}"
+        f"  probes={r.get('probes_sent', '?')}/{r.get('probes_total', '?')}"
+        f"  cost=${r.get('cost_usd', '?')}"
+        f"  duration={r.get('duration_s', '?')}s",
+        highlight=False,
+    )
+    console.print(
+        f"severity  critical={sev.get('critical', 0)}"
+        f"  high={sev.get('high', 0)}"
+        f"  medium={sev.get('medium', 0)}"
+        f"  low={sev.get('low', 0)}",
+        highlight=False,
+    )
+    if not findings:
+        console.print("finding  (none)", highlight=False)
+    for f in findings:
+        evidence = _clip(f.get("evidence_span") or "", 100)
+        parts = [
+            f"finding  severity={f.get('severity', '?')}",
+            f"title={f.get('title', '')}",
+            f"category={f.get('category', '')}",
+        ]
+        if f.get("technique"):
+            parts.append(f"technique={f['technique']}")
+        if f.get("owasp"):
+            parts.append(f"owasp={f['owasp']}")
+        if f.get("atlas"):
+            parts.append(f"atlas={f['atlas']}")
+        if evidence:
+            parts.append(f"evidence={evidence}")
+        console.print("  ".join(parts), highlight=False)
+    for t in sorted(r.get("category_tiles") or [], key=lambda x: x["category"]):
+        if t.get("gateway_only"):
+            console.print(
+                f"category  id={t['category']}  name={t['name']}  access=gateway-only",
+                highlight=False,
+            )
+        else:
+            console.print(
+                f"category  id={t['category']}  name={t['name']}"
+                f"  grade={t.get('sub_grade', '?')}"
+                f"  findings={t.get('findings', 0)}"
+                f"  probes={t.get('probes_used', 0)}"
+                f"  access=black-box",
+                highlight=False,
+            )
 
 
 async def _validate_api_key(ws_url: str, api_key: str) -> None:
@@ -571,7 +620,14 @@ def _auth_main(argv: list[str]) -> int:
         parser.error(str(exc))
 
     if args.command == "login":
-        api_key = getpass.getpass("Respan API key: ").strip()
+        try:
+            api_key = getpass.getpass("Respan API key: ").strip()
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            return 130
+        except EOFError:
+            print("\nerror: no API key provided (stdin closed)", file=sys.stderr)
+            return 2
         if not api_key:
             print("error: API key cannot be empty", file=sys.stderr)
             return 2
@@ -674,7 +730,21 @@ def _config_main(argv: list[str]) -> int:
         editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
         if not editor:
             raise UserConfigError("set $VISUAL or $EDITOR before using `config edit`")
-        completed = subprocess.run([*shlex.split(editor), str(path)], check=False)
+        try:
+            command = shlex.split(editor)
+        except ValueError as exc:  # unbalanced quotes in $VISUAL/$EDITOR
+            _error(f"could not parse editor command {editor!r}", exc,
+                   hint="Check the quoting in $VISUAL/$EDITOR.")
+            return 2
+        try:
+            completed = subprocess.run([*command, str(path)], check=False)
+        except OSError as exc:
+            _error(f"could not launch editor {editor!r}", exc,
+                   hint="Check that $VISUAL/$EDITOR points to an executable on your PATH.")
+            return 2
+        except KeyboardInterrupt:
+            print("\ninterrupted", file=sys.stderr)
+            return 130
         if completed.returncode != 0:
             return completed.returncode
         load_profile()
@@ -715,7 +785,7 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
   respan-redteam scan adapter.py --fail-under B
   respan-redteam scan adapter.py --local""",
     )
-    parser.add_argument("adapter", nargs="?" if legacy else None, metavar="ADAPTER",
+    parser.add_argument("adapter", nargs="?", metavar="ADAPTER",
                         help="Python file that connects the scanner to your agent")
     tgt = parser.add_argument_group("target — your agent")
     if legacy:
@@ -824,7 +894,7 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
 
     # --- REMOTE scan (default): engine on the server, your agent on this machine (over WebSocket) ---
     if not args.local:
-        prog.note(f"remote scan · {getattr(target, 'label', 'target')} → {args.ws_url}")
+        prog.note(f"scan · {getattr(target, 'label', 'target')} → {args.ws_url}")
         try:
             return asyncio.run(_run_remote(
                 args.ws_url, args.api_key, target, args.format, args.output, args.retries,
@@ -882,6 +952,8 @@ Run `respan-redteam <command> --help` for command-specific options.""",
     commands.add_parser("scan", add_help=False, help="run a red-team campaign")
     commands.add_parser("auth", add_help=False, help="manage your Respan API key")
     commands.add_parser("config", add_help=False, help="manage non-secret CLI profiles")
+    commands.add_parser("tui-test", add_help=False,
+                        help="replay a mock campaign through the progress printer")
     return parser
 
 
@@ -890,23 +962,41 @@ def main(argv: list[str] | None = None) -> int:
     if not argv:
         _root_parser().print_help()
         return 0
-    if argv[0] == "scan":
-        return _scan_main(argv[1:])
-    if argv[0] == "auth":
-        return _auth_main(argv[1:])
-    if argv[0] == "config":
-        return _config_main(argv[1:])
-    if argv[0] in ("-h", "--help", "--version"):
-        _root_parser().parse_args(argv)
-        return 0
-    # Backward compatibility for 0.1.x: `respan-redteam adapter.py [options]`.
-    first = argv[0]
-    if first.startswith("-") or first.endswith(".py") or Path(first).exists():
-        return _scan_main(argv, legacy=True)
-    _root_parser().error(
-        f"unknown command {first!r}; choose `scan`, `auth`, or `config`"
-    )
-    return 2
+    try:
+        if argv[0] == "scan":
+            return _scan_main(argv[1:])
+        if argv[0] == "auth":
+            return _auth_main(argv[1:])
+        if argv[0] == "config":
+            return _config_main(argv[1:])
+        if argv[0] == "tui-test":
+            from .tui_test import main as tui_test_main
+            return tui_test_main(argv[1:])
+        if argv[0] in ("-h", "--help", "--version"):
+            _root_parser().parse_args(argv)
+            return 0
+        # Backward compatibility for 0.1.x: `respan-redteam adapter.py [options]`.
+        first = argv[0]
+        if first.startswith("-") or first.endswith(".py") or Path(first).exists():
+            return _scan_main(argv, legacy=True)
+        _root_parser().error(
+            f"unknown command {first!r}; choose `scan`, `auth`, `config`, or `tui-test`"
+        )
+        return 2
+    except KeyboardInterrupt:
+        # A last-resort net: the scan/auth paths already handle interrupts around their own I/O
+        # (returning 130 there too); this only catches a Ctrl-C outside those windows (e.g. while
+        # importing an adapter) so it never surfaces as a raw Python traceback.
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    except SystemExit:
+        raise   # argparse's normal --help/--version/parser.error() control flow
+    except Exception as exc:  # noqa: BLE001 -- nothing should reach the user as a raw traceback
+        _error("unexpected internal error", exc,
+               hint="This looks like a bug in respan-redteam — please open an issue with "
+                    "RESPAN_REDTEAM_DEBUG=1 output at "
+                    "https://github.com/respanai/respan-redteam/issues.")
+        return 1
 
 
 if __name__ == "__main__":
