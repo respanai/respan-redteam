@@ -29,7 +29,7 @@ def test_missing_file_produces_a_hosted_default():
     with tempfile.TemporaryDirectory() as root, _config_environment(root):
         profile = load_profile()
         assert profile.mode == "hosted"
-        assert profile.server == "https://redteam.respan.ai"
+        assert profile.server == "https://api.respan.ai"
 
 
 def test_local_profile_rejects_server_and_hosted_profile_rejects_models():

@@ -12,7 +12,7 @@ from typing import Any
 import tomli_w
 
 
-DEFAULT_SERVER = "https://redteam.respan.ai"
+DEFAULT_SERVER = "https://api.respan.ai"
 GRADES = {"A", "B", "C", "D", "F"}
 MODEL_KEYS = {
     "model_attacker",

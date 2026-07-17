@@ -1,6 +1,6 @@
 """Command-line entry point for the red-team engine.
 
-    python -m respan_redteam --adapter ./adapter.py                 # remote scan (engine on redteam.respan.ai)
+    python -m respan_redteam --adapter ./adapter.py                 # remote scan (engine on api.respan.ai)
     python -m respan_redteam --adapter ./adapter.py --local         # run the engine on this machine
     python -m respan_redteam --adapter ./adapter.py --json > report.json
     python -m respan_redteam auth login                              # save a Respan API key
@@ -8,7 +8,7 @@
 Point the engine at YOUR OWN agent via an adapter.py — a Target with `open() -> Chat` and
 `chat.send(user_msg) -> str` (see target.py). A scan runs one of two ways:
 
-  * REMOTE (default): the engine runs on redteam.respan.ai and exchanges chat messages with your
+  * REMOTE (default): the engine runs on api.respan.ai and exchanges chat messages with your
     local adapter over a WebSocket (override with `--ws-url`).
   * LOCAL (`--local`): the engine runs in-process on this machine (needs an OpenAI key).
 
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import getpass
 import importlib.util
 import inspect
 import io
@@ -49,10 +48,14 @@ from .tui import (
 )
 from .credentials import (
     CredentialStoreUnavailable,
+    credentials_path,
     delete_api_key,
+    delete_file_api_key,
+    load_file_api_key,
     load_stored_api_key,
     resolve_api_key,
     save_api_key,
+    save_file_api_key,
 )
 from .model_client import TransientLLMError
 from .user_config import (
@@ -71,14 +74,14 @@ from .user_config import (
 
 load_dotenv(find_dotenv(usecwd=True) or find_dotenv(), override=False)
 
-BUILTIN_SERVER = "https://redteam.respan.ai"
+BUILTIN_SERVER = "https://api.respan.ai"
 DEFAULT_SERVER = os.environ.get("RESPAN_REDTEAM_SERVER", BUILTIN_SERVER)
 DEFAULT_WS_URL = os.environ.get("RESPAN_REDTEAM_WS_URL", "")
 try:
     from importlib.metadata import version
     __version__ = version("respan-redteam")
 except Exception:  # package metadata is optional in a source checkout
-    __version__ = "0.1.4"
+    __version__ = "0.1.5"
 
 def _server_to_ws_url(server: str) -> str:
     """Accept a friendly HTTP origin or the legacy full WebSocket endpoint."""
@@ -412,10 +415,90 @@ async def _validate_api_key(ws_url: str, api_key: str) -> None:
     await connection.close()
 
 
+def _prompt_api_key(prompt: str = "Respan API key: ") -> str:
+    """Read an API key from the TTY, echoing each character as '*'."""
+    stream_out = sys.stderr if sys.stderr.isatty() else sys.stdout
+    stream_out.write(prompt)
+    stream_out.flush()
+
+    if not sys.stdin.isatty():
+        line = sys.stdin.readline()
+        if not line:
+            raise EOFError
+        return line.rstrip("\r\n")
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        chars: list[str] = []
+        while True:
+            ch = msvcrt.getwch()
+            if ch in ("\r", "\n"):
+                stream_out.write("\n")
+                stream_out.flush()
+                break
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\x08", "\x7f"):
+                if chars:
+                    chars.pop()
+                    stream_out.write("\b \b")
+                    stream_out.flush()
+                continue
+            if ch == "\x00" or ch == "\xe0":
+                msvcrt.getwch()  # discard special-key trail byte
+                continue
+            if ord(ch) < 32:
+                continue
+            chars.append(ch)
+            stream_out.write("*")
+            stream_out.flush()
+        return "".join(chars)
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    chars = []
+    try:
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\n", "\r"):
+                stream_out.write("\n")
+                stream_out.flush()
+                break
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch == "\x04" and not chars:
+                raise EOFError
+            if ch in ("\x7f", "\b"):
+                if chars:
+                    chars.pop()
+                    stream_out.write("\b \b")
+                    stream_out.flush()
+                continue
+            if ch == "\x15":  # Ctrl-U — clear line
+                while chars:
+                    chars.pop()
+                    stream_out.write("\b \b")
+                stream_out.flush()
+                continue
+            if ord(ch) < 32:
+                continue
+            chars.append(ch)
+            stream_out.write("*")
+            stream_out.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return "".join(chars)
+
+
 def _auth_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="respan-redteam auth",
-        description="Manage the Respan API key in your system credential store.",
+        description="Manage the Respan API key (system credential store, with file fallback).",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     descriptions = {
@@ -451,7 +534,7 @@ def _auth_main(argv: list[str]) -> int:
 
     if args.command == "login":
         try:
-            api_key = getpass.getpass("Respan API key: ").strip()
+            api_key = _prompt_api_key().strip()
         except KeyboardInterrupt:
             print("\ninterrupted", file=sys.stderr)
             return 130
@@ -463,40 +546,53 @@ def _auth_main(argv: list[str]) -> int:
             return 2
         try:
             asyncio.run(_validate_api_key(ws_url, api_key))
-            save_api_key(ws_url, api_key)
-        except CredentialStoreUnavailable:
-            _error(
-                "system credential store is unavailable",
-                hint="Configure a system keyring or set RESPAN_API_KEY for this shell.",
-            )
-            return 2
         except Exception as exc:  # noqa: BLE001 -- auth/network errors are user-facing.
             _error("could not authenticate", exc, hint="Check the key and hosted engine URL.")
             return 2
-        print("Authenticated. API key saved in the system credential store.")
+        try:
+            save_api_key(ws_url, api_key)
+            location = "system credential store"
+        except CredentialStoreUnavailable:
+            try:
+                save_file_api_key(ws_url, api_key)
+            except OSError as exc:
+                _error(
+                    "could not save API key",
+                    exc,
+                    hint="Configure a system keyring or set RESPAN_API_KEY for this shell.",
+                )
+                return 2
+            location = f"credentials file ({credentials_path()})"
+        print(f"Authenticated. API key saved in the {location}.")
         return 0
 
-    try:
-        if args.command == "status":
-            environment = os.environ.get("RESPAN_API_KEY") or os.environ.get(
-                "RESPAN_REDTEAM_API_KEY"
-            )
-            if environment:
-                print("API key configured in the environment.")
-                return 0
-            stored = load_stored_api_key(ws_url)
-            if stored:
-                print("API key configured in the system credential store.")
-                return 0
-            print("Not authenticated. Run `respan-redteam auth login`.")
-            return 1
-        deleted = delete_api_key(ws_url)
-    except CredentialStoreUnavailable:
-        _error(
-            "system credential store is unavailable",
-            hint="Configure a system keyring or use RESPAN_API_KEY for this shell.",
+    if args.command == "status":
+        environment = os.environ.get("RESPAN_API_KEY") or os.environ.get(
+            "RESPAN_REDTEAM_API_KEY"
         )
-        return 2
+        if environment:
+            print("API key configured in the environment.")
+            return 0
+        try:
+            stored = load_stored_api_key(ws_url)
+        except CredentialStoreUnavailable:
+            stored = None
+        if stored:
+            print("API key configured in the system credential store.")
+            return 0
+        if load_file_api_key(ws_url):
+            print(f"API key configured in the credentials file ({credentials_path()}).")
+            return 0
+        print("Not authenticated. Run `respan-redteam auth login`.")
+        return 1
+
+    # logout — clear both stores when present
+    deleted = False
+    try:
+        deleted = delete_api_key(ws_url) or deleted
+    except CredentialStoreUnavailable:
+        pass
+    deleted = delete_file_api_key(ws_url) or deleted
     print("Logged out." if deleted else "No stored API key was found.")
     if os.environ.get("RESPAN_API_KEY") or os.environ.get("RESPAN_REDTEAM_API_KEY"):
         print("RESPAN_API_KEY remains set in the environment and still takes precedence.")
@@ -531,7 +627,7 @@ def _config_main(argv: list[str]) -> int:
         if args.command == "show":
             print(render_profile(load_profile(args.profile)), end="")
             print("# OPENAI_API_KEY: environment only")
-            print("# RESPAN_API_KEY: environment or system credential store")
+            print("# RESPAN_API_KEY: environment, system credential store, or .credentials.json")
             return 0
         if args.command == "use":
             set_selected_profile(args.profile)

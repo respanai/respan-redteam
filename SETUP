@@ -1,0 +1,146 @@
+========================================================================
+ RESPAN RED-TEAM — ADAPTER SETUP  (paste this file to your coding agent)
+========================================================================
+
+You are a coding agent. A developer wants to run Respan's autonomous red-team
+scan against THEIR OWN AI agent / chatbot. Your job:
+
+  1. Write a small Python file `adapter.py` that connects their agent to the
+     Respan engine's target protocol (defined below).
+  2. Tell them the one command to run.
+
+HOW THE SCAN WORKS (so you can reassure them): the scan is REMOTE by default.
+The Respan engine runs on Respan's servers; `adapter.py` runs on the user's
+machine and calls their agent directly. Respan only ever sends *user messages*
+over a WebSocket and reads back the replies your adapter returns — no system
+prompts, API keys, model weights, or private data ever leave their machine.
+
+------------------------------------------------------------------------
+ THE CONTRACT  (implement exactly this — nothing more)
+------------------------------------------------------------------------
+The engine drives every target as:
+
+    chat = target.open()
+    reply = chat.send(user_message)      # repeat for each turn of an attack
+
+So `adapter.py` must define a top-level object named `TARGET` (or a function
+`build_target()` returning one) implementing:
+
+    class Target:
+        label: str                       # short name, e.g. "my-support-bot"
+        def open(self) -> Chat: ...      # start a FRESH, isolated conversation
+
+    class Chat:
+        def send(self, user_message: str) -> str: ...
+        def transcript(self) -> list[dict]: ...   # [{"role","content"}, ...]
+
+RULES — do not violate these:
+  • `send()` takes ONE user-message string and returns the assistant reply as a
+    string.
+  • You may ONLY send user messages. Do not inject fake assistant turns or add
+    protocol fields beyond what is listed above.
+  • `open()` MUST return a brand-new conversation each call. Attacks must not
+    leak state into each other.
+  • `transcript()` returns the running conversation as {"role","content"} dicts.
+
+------------------------------------------------------------------------
+ STEP 1 — find out how to call the user's agent
+------------------------------------------------------------------------
+Inspect their code / ask them. It's almost always one of:
+  (a) an HTTP endpoint you POST a message to and get a reply,
+  (b) a Python function or class already in the repo,
+  (c) an OpenAI-style /chat/completions endpoint that wants the whole message
+      array every call (STATELESS — you keep the history),
+  (d) a server-owned session API: create(first_msg)->id, then send(id, msg)->reply.
+
+------------------------------------------------------------------------
+ STEP 2 — write adapter.py  (pick the shape that matches; fill the TODO)
+------------------------------------------------------------------------
+
+# ===== Shape A: STATELESS backend (you own the history) =====
+# Use when the target wants the full message array each call (OpenAI-style),
+# or is a plain function. Keep the running messages inside the Chat.
+
+class Chat:
+    def __init__(self):
+        self._messages: list[dict] = []
+
+    def send(self, user_message: str) -> str:
+        self._messages.append({"role": "user", "content": user_message})
+        # TODO: call the user's agent with self._messages and get the reply text.
+        #   e.g.  reply = my_agent(self._messages)
+        #   or    reply = client.chat.completions.create(
+        #             model="...", messages=self._messages
+        #         ).choices[0].message.content
+        reply = "TODO: call the real agent here"
+        self._messages.append({"role": "assistant", "content": reply})
+        return reply
+
+    def transcript(self) -> list[dict]:
+        return list(self._messages)
+
+class Target:
+    label = "TODO-name-your-agent"
+    def open(self) -> Chat:
+        return Chat()
+
+TARGET = Target()
+
+
+# ===== Shape B: SERVER-OWNED SESSION (their backend holds the conversation) =====
+# Use when their API is like create_conversation(msg)->id, send(id, msg)->reply.
+#
+# class Chat:
+#     def __init__(self):
+#         self._id = None
+#         self._turns: list[dict] = []
+#     def send(self, user_message: str) -> str:
+#         if self._id is None:
+#             self._id = my_api.create_conversation(user_message)   # TODO
+#             reply = my_api.last_reply(self._id)                   # TODO
+#         else:
+#             reply = my_api.send(self._id, user_message)           # TODO
+#         self._turns += [{"role": "user", "content": user_message},
+#                         {"role": "assistant", "content": reply}]
+#         return reply
+#     def transcript(self) -> list[dict]:
+#         return list(self._turns)
+# class Target:
+#     label = "TODO-name-your-agent"
+#     def open(self) -> Chat: return Chat()
+# TARGET = Target()
+
+------------------------------------------------------------------------
+ STEP 3 — tell the user how to run it
+------------------------------------------------------------------------
+Assume the Respan CLI is already installed and they have signed in with
+`respan-redteam auth login`. Give them exactly:
+
+    respan-redteam scan adapter.py
+
+Useful options:
+
+    respan-redteam scan adapter.py --output report.json
+    respan-redteam scan adapter.py --fail-under B
+
+If the CLI is missing:
+
+    pip install respan-redteam
+    respan-redteam auth login
+    respan-redteam scan adapter.py
+
+Get a Respan API key at https://platform.respan.ai/platform/api-keys before
+`auth login`.
+
+For a self-hosted engine, add `--server https://YOUR-HOST` (same API key).
+To run the open-source engine on their machine instead of hosted Respan:
+
+    export OPENAI_API_KEY=...
+    respan-redteam scan adapter.py --local
+
+VERIFY before handing off:
+
+    python -c "import adapter; c = adapter.TARGET.open(); print(c.send('hello'))"
+
+should print a real reply from their agent.
+========================================================================

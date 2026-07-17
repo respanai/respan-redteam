@@ -23,6 +23,7 @@ from respan_redteam.credentials import (
     resolve_api_key,
     save_api_key,
 )
+from pathlib import Path
 from respan_redteam.user_config import ProfileConfig
 
 
@@ -54,7 +55,7 @@ _EVENTS = [
     ("report.ready", {"grade": "F", "score": 40, "findings": 1, "probes": 12}),
 ]
 
-DEFAULT_URL = "wss://redteam.respan.ai/redteam/remote/"
+DEFAULT_URL = "wss://api.respan.ai/redteam/remote/"
 
 
 def test_progress_prints_every_event():
@@ -226,7 +227,10 @@ def test_campaign_url_falls_back_to_same_origin_for_unmapped_hosts():
 
 
 def test_server_origin_becomes_remote_websocket_endpoint():
-    assert _server_to_ws_url("https://redteam.respan.ai") == DEFAULT_URL
+    assert _server_to_ws_url("https://api.respan.ai") == DEFAULT_URL
+    assert _server_to_ws_url("https://redteam.respan.ai") == (
+        "wss://redteam.respan.ai/redteam/remote/"
+    )
     assert _server_to_ws_url("http://localhost:8000/") == (
         "ws://localhost:8000/redteam/remote/"
     )
@@ -281,8 +285,14 @@ def test_api_key_resolution_prefers_flag_then_environment_then_keyring():
         assert resolve_api_key(DEFAULT_URL, "from-flag") == ("from-flag", "--api-key")
         assert resolve_api_key(DEFAULT_URL) == ("from-env", "environment")
     with patch.dict(os.environ, {}, clear=True), \
-         patch("respan_redteam.credentials.load_stored_api_key", return_value="stored"):
+         patch("respan_redteam.credentials.load_stored_api_key", return_value="stored"), \
+         patch("respan_redteam.credentials.load_file_api_key", return_value=None):
         assert resolve_api_key(DEFAULT_URL) == ("stored", "system credential store")
+    with patch.dict(os.environ, {}, clear=True), \
+         patch("respan_redteam.credentials.load_stored_api_key",
+               side_effect=CredentialStoreUnavailable("no keyring")), \
+         patch("respan_redteam.credentials.load_file_api_key", return_value="from-file"):
+        assert resolve_api_key(DEFAULT_URL) == ("from-file", "credentials file")
 
 
 def test_credential_save_rejects_a_backend_that_does_not_persist():
@@ -295,9 +305,29 @@ def test_credential_save_rejects_a_backend_that_does_not_persist():
             pass
 
 
+def test_file_credentials_round_trip_next_to_config():
+    from respan_redteam.credentials import (
+        credentials_path,
+        delete_file_api_key,
+        load_file_api_key,
+        save_file_api_key,
+    )
+
+    with tempfile.TemporaryDirectory() as root:
+        config = Path(root) / "config.toml"
+        with patch.dict(os.environ, {"RESPAN_REDTEAM_CONFIG": str(config)}, clear=False):
+            assert credentials_path() == Path(root) / ".credentials.json"
+            save_file_api_key(DEFAULT_URL, "file-secret")
+            assert load_file_api_key(DEFAULT_URL) == "file-secret"
+            assert oct(credentials_path().stat().st_mode & 0o777) == "0o600"
+            assert delete_file_api_key(DEFAULT_URL) is True
+            assert load_file_api_key(DEFAULT_URL) is None
+            assert not credentials_path().exists()
+
+
 def test_auth_login_validates_before_saving_without_echoing_key():
     output = io.StringIO()
-    with patch("respan_redteam.cli.getpass.getpass", return_value="secret-key"), \
+    with patch("respan_redteam.cli._prompt_api_key", return_value="secret-key"), \
          patch("respan_redteam.cli._validate_api_key", new=AsyncMock()), \
          patch("respan_redteam.cli.save_api_key") as save, redirect_stdout(output):
         assert _auth_main(["login", "--ws-url", DEFAULT_URL]) == 0
@@ -306,11 +336,28 @@ def test_auth_login_validates_before_saving_without_echoing_key():
     assert "system credential store" in output.getvalue()
 
 
+def test_auth_login_falls_back_to_credentials_file_when_keyring_unavailable():
+    output = io.StringIO()
+    with patch("respan_redteam.cli._prompt_api_key", return_value="secret-key"), \
+         patch("respan_redteam.cli._validate_api_key", new=AsyncMock()), \
+         patch("respan_redteam.cli.save_api_key",
+               side_effect=CredentialStoreUnavailable("no keyring")), \
+         patch("respan_redteam.cli.save_file_api_key") as save_file, \
+         patch("respan_redteam.cli.credentials_path",
+               return_value=Path("/tmp/.credentials.json")), \
+         redirect_stdout(output):
+        assert _auth_main(["login", "--ws-url", DEFAULT_URL]) == 0
+    save_file.assert_called_once_with(DEFAULT_URL, "secret-key")
+    text = output.getvalue()
+    assert "secret-key" not in text
+    assert "credentials file" in text
+
+
 def test_auth_login_accepts_a_friendly_server_origin():
-    with patch("respan_redteam.cli.getpass.getpass", return_value="secret-key"), \
+    with patch("respan_redteam.cli._prompt_api_key", return_value="secret-key"), \
          patch("respan_redteam.cli._validate_api_key", new=AsyncMock()) as validate, \
          patch("respan_redteam.cli.save_api_key") as save, redirect_stdout(io.StringIO()):
-        assert _auth_main(["login", "--server", "https://redteam.respan.ai"]) == 0
+        assert _auth_main(["login", "--server", "https://api.respan.ai"]) == 0
     validate.assert_awaited_once_with(DEFAULT_URL, "secret-key")
     save.assert_called_once_with(DEFAULT_URL, "secret-key")
 
@@ -318,7 +365,7 @@ def test_auth_login_accepts_a_friendly_server_origin():
 def test_auth_login_does_not_save_a_rejected_key():
     output = io.StringIO()
     rejected = AsyncMock(side_effect=RuntimeError("rejected"))
-    with patch("respan_redteam.cli.getpass.getpass", return_value="bad-key"), \
+    with patch("respan_redteam.cli._prompt_api_key", return_value="bad-key"), \
          patch("respan_redteam.cli._validate_api_key", new=rejected), \
          patch("respan_redteam.cli.save_api_key") as save, redirect_stderr(output):
         assert _auth_main(["login", "--ws-url", DEFAULT_URL]) == 2
