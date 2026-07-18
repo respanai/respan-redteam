@@ -459,8 +459,12 @@ class _Progress:
     def _on_report_ready(self, data: dict) -> None:
         self._advance("report")
         grade = str(data.get("grade", "?"))
-        self._status = "done" if grade not in ("n/a", "?") else "faulted"
-        line = Text("  done  ", style="dim")
+        status = str(data.get("status", ""))
+        incomplete = status == "incomplete" or grade in ("n/a", "?")
+        partial = status == "partial"
+        self._status = "faulted" if incomplete else "done"
+        label = "  incomplete  " if incomplete else "  partial  " if partial else "  done  "
+        line = Text(label, style="warn" if incomplete or partial else "dim")
         line.append(f"grade {grade}", style=_GRADE_STYLE.get(grade, "dim"))
         line.append(
             f"  ·  score {data.get('score', '?')}"
@@ -562,8 +566,10 @@ def _print_report(r: dict, console: Console, *, console_url: str | None = None) 
     # grade hero
     hero = Text()
     hero.append(_grade_badge(grade))
-    hero.append(f"   {r.get('score', '?')}/100", style="text")
-    hero.append(f"      resistance {_pct(r.get('resistance_rate', 0))}", style="dim")
+    score = r.get("score")
+    resistance = r.get("resistance_rate")
+    hero.append(f"   {score if score is not None else '?'}/100", style="text")
+    hero.append(f"      resistance {_pct(resistance) if resistance is not None else 'n/a'}", style="dim")
     console.print(
         Padding(
             Panel(
@@ -580,9 +586,16 @@ def _print_report(r: dict, console: Console, *, console_url: str | None = None) 
 
     meta = Text("   ")
     meta.append(str(r.get("target_label", "?")), style="text")
+    probe_health = ""
+    if r.get("probes_errored"):
+        probe_health = (
+            f"  ·  {r.get('probes_completed', 0)} evaluated"
+            f"  ·  {r.get('probes_errored', 0)} errors"
+        )
     meta.append(
         f"  ·  {findings_count} findings"
         f"  ·  {r.get('probes_sent', '?')}/{r.get('probes_total', '?')} probes"
+        f"{probe_health}"
         f"  ·  ${r.get('cost_usd', '?')}"
         f"  ·  {r.get('duration_s', '?')}s",
         style="dim",
@@ -618,7 +631,12 @@ def _print_report(r: dict, console: Console, *, console_url: str | None = None) 
     console.print()
     console.print(_section("findings"))
     if not findings:
-        console.print(Text("   none — the target held", style="good"))
+        if r.get("status") == "incomplete":
+            console.print(Text("   unknown — scan incomplete", style="warn"))
+        elif r.get("status") == "partial":
+            console.print(Text("   none in evaluated probes — partial scan", style="warn"))
+        else:
+            console.print(Text("   none — the target held", style="good"))
     for f in findings:
         fsev = str(f.get("severity", "?"))
         console.print(_finding_title(fsev, f.get("title", "")))

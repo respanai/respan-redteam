@@ -32,9 +32,10 @@ class SessionStart(Event):
 class ReportReady(Event):
     event = "report.ready"
     grade: str
-    score: int
+    score: int | None
     findings: int
     probes: int
+    status: str | None = None
 
 
 # --- recon -------------------------------------------------------------------

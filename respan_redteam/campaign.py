@@ -162,10 +162,13 @@ def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
     result.categories = _assemble(scope, per_goal, findings_by_cat)
     result.probes_total = cfg.max_target_probes
     result.probes_sent = current_budget().sent
+    result.probes_completed = current_budget().completed
+    result.probes_errored = current_budget().errored
     result.finished_at = time.time()
     result.cost_usd = _estimate_cost(current_usage())
     emit(ReportReady(grade=result.grade(), score=result.score(),
-                     findings=len(result.all_findings), probes=current_budget().sent))
+                     findings=len(result.all_findings), probes=current_budget().sent,
+                     status=result.status))
     return result
 
 

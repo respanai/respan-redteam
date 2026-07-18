@@ -84,10 +84,14 @@ def build_report(result: CampaignResult) -> dict:
     prof = result.profile
     return {
         "target_label": result.target_label,
+        "status": result.status,
         "grade": result.grade(),
         "score": result.score(),
-        "resistance_rate": round(result.resistance_rate, 3),
+        "resistance_rate": (round(result.resistance_rate, 3)
+                            if result.resistance_rate is not None else None),
         "probes_sent": result.probes_sent,
+        "probes_completed": result.probes_completed,
+        "probes_errored": result.probes_errored,
         "probes_total": result.probes_total,
         "cost_usd": result.cost_usd,
         "duration_s": round((result.finished_at or 0) - (result.started_at or 0), 1),

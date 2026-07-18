@@ -8,7 +8,8 @@ import re
 from . import model_client
 from .runtime import BudgetExhausted, current_config, emit, open_chat
 from .events import ReconProbeResult, ReconProbeSent, ReconProfileReady
-from .models import ReconProfile, TargetType, DetectedTool, Probe, Round
+from .models import (ReconProfile, TargetErrorResponse, TargetType, DetectedTool, Probe,
+                     Round)
 
 # (name, kind, prompt). kind in {fingerprint, extract, tools, refusal}
 RECON_PROBES: list[tuple[str, str, str]] = [
@@ -107,8 +108,10 @@ def run_recon(recon_probes: int = 9) -> tuple[ReconProfile, list[Probe]]:
         except BudgetExhausted:
             break
         except Exception as exc:  # noqa: BLE001
-            resp = f"[target error: {exc}]"
-        p = Probe(category=f"recon/{kind}", technique=name, rounds=[Round(prompt=prompt, response=resp)])
+            resp = TargetErrorResponse(f"[target error: {exc}]")
+        p = Probe(category=f"recon/{kind}", technique=name,
+                  rounds=[Round(prompt=prompt, response=resp,
+                                errored=isinstance(resp, TargetErrorResponse))])
         probes.append(p)
         emit(ReconProbeResult(name=name, snippet=resp[:280]))
 

@@ -17,7 +17,7 @@ from ..runtime import (
 )
 from ..events import VerdictEvent
 from .attacker import history_str
-from ..models import JudgeVerdict, Outcome, Probe, Round, Severity
+from ..models import JudgeVerdict, Outcome, Probe, Round, Severity, TargetErrorResponse
 
 
 class CanaryCollector:
@@ -122,7 +122,10 @@ def run_action_loop(*, category: str, technique: str, objective: str, must_inclu
             response = chat.send(message, technique=technique)
         except BudgetExhausted:
             break
-        probe.rounds.append(Round(prompt=message, response=response))
+        probe.rounds.append(Round(prompt=message, response=response,
+                                  errored=isinstance(response, TargetErrorResponse)))
+        if probe.rounds[-1].errored:
+            break
         hit, evidence, severity = success_fn(response)
         emit(VerdictEvent(outcome="success" if hit else "refused", severity=severity.value))
         if hit:

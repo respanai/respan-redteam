@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .events import AttackAttempt, TargetResponseEvent
-from .models import EventSink, ReconProfile
+from .models import EventSink, ReconProfile, TargetErrorResponse
 
 if TYPE_CHECKING:
     from .config import BudgetConfig, EngineConfig
@@ -33,6 +33,8 @@ class Budget:
     """Counter of TARGET probes. `consume()` reserves a slot and raises at the cap."""
     max_probes: int
     sent: int = 0
+    completed: int = 0
+    errored: int = 0
 
     def remaining(self) -> int:
         return max(0, self.max_probes - self.sent)
@@ -44,6 +46,12 @@ class Budget:
         if not self.can_send(n):
             raise BudgetExhausted()
         self.sent += n
+
+    def mark_errored(self) -> None:
+        """Reclassify one completed target probe when delivery or evaluation failed."""
+        if self.completed:
+            self.completed -= 1
+        self.errored += 1
 
 
 
@@ -177,12 +185,15 @@ class ScopedChat:
         except BudgetExhausted:
             raise
         except Exception as exc:  # noqa: BLE001
-            resp = f"[target error: {exc}]"
+            ctx.budget.mark_errored()
+            resp = TargetErrorResponse(f"[target error: {exc}]")
         # Defence in depth: a Chat.send should return a str, but a user adapter might hand back None;
         # coerce so the reply is always safe to slice/judge. (The sandbox chat coerces at its layer
         # too, keeping None out of the stored transcript.)
         if not isinstance(resp, str):
             resp = "" if resp is None else str(resp)
+        if not isinstance(resp, TargetErrorResponse):
+            ctx.budget.completed += 1
         if narrate:
             emit(TargetResponseEvent(snippet=resp[:400], probes_used=ctx.budget.sent))
         return resp

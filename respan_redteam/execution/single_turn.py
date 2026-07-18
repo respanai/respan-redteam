@@ -10,7 +10,7 @@ from collections.abc import Callable
 
 from ..runtime import BudgetExhausted, open_chat
 from ..goals import Goal
-from ..models import Probe, Round
+from ..models import Probe, Round, TargetErrorResponse
 
 
 def run_single_turn(
@@ -33,7 +33,9 @@ def run_single_turn(
     except BudgetExhausted:
         return None
 
-    graded_response = response_for_judge(response) if response_for_judge else response
+    graded_response = response if isinstance(response, TargetErrorResponse) else (
+        response_for_judge(response) if response_for_judge else response
+    )
     round_ = Round.judged(goal, message, graded_response)
     round_.response = response
     return Probe(category=goal.category, technique=technique, rounds=[round_])
