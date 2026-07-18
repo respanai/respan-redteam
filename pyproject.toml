@@ -1,6 +1,6 @@
 [project]
 name = "respan-redteam"
-version = "0.1.6"
+version = "0.1.7"
 description = "Adaptive red-team engine and CLI for AI agents"
 readme = "README.md"
 requires-python = ">=3.11"
