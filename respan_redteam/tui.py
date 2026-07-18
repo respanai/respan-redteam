@@ -588,10 +588,7 @@ def _print_report(r: dict, console: Console, *, console_url: str | None = None) 
     meta.append(str(r.get("target_label", "?")), style="text")
     probe_health = ""
     if r.get("probes_errored"):
-        probe_health = (
-            f"  ·  {r.get('probes_completed', 0)} evaluated"
-            f"  ·  {r.get('probes_errored', 0)} errors"
-        )
+        probe_health = f"  ·  {r.get('probes_errored', 0)} errors"
     meta.append(
         f"  ·  {findings_count} findings"
         f"  ·  {r.get('probes_sent', '?')}/{r.get('probes_total', '?')} probes"
