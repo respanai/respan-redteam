@@ -40,7 +40,7 @@ export RESPAN_API_KEY="..."
 Paste this into your coding agent (Cursor, Claude Code, Codex, etc.):
 
 ```text
-Fetch https://raw.githubusercontent.com/respanai/respan-redteam/refs/heads/main/SETUP
+Fetch https://www.respan.ai/redteam-setup.txt
 and follow it to create adapter.py for my agent, then tell me how to run the scan.
 ```
 
