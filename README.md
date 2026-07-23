@@ -1,4 +1,19 @@
-# Respan Red Team
+<div align="center">
+  <a href="https://www.respan.ai"><img src="https://raw.githubusercontent.com/respanai/respan-redteam/main/docs/assets/banner.png" alt="Respan security" width="100%"></a>
+</div>
+
+<div align="center">
+  <a href="https://pypi.org/project/respan-redteam/"><img src="https://img.shields.io/pypi/v/respan-redteam" alt="PyPI"></a>
+  <a href="https://pypi.org/project/respan-redteam/"><img src="https://img.shields.io/pypi/pyversions/respan-redteam" alt="Python versions"></a>
+  <a href="https://github.com/respanai/respan-redteam/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"></a>
+  <a href="https://www.ycombinator.com/companies/respan"><img src="https://img.shields.io/badge/Y%20Combinator-W24-orange" alt="Y Combinator W24"></a>
+  <a href="https://www.respan.ai"><img src="https://img.shields.io/badge/Platform-respan.ai-green.svg?style=flat-square" alt="Platform"></a>
+  <a href="https://docs.respan.ai/get-started/overview"><img src="https://img.shields.io/badge/Documentation-docs.respan.ai-blue.svg?style=flat-square" alt="Documentation"></a>
+  <a href="https://x.com/respan/"><img src="https://img.shields.io/twitter/follow/respan?style=social" alt="Twitter"></a>
+  <a href="https://discord.com/invite/KEanfAafQQ"><img src="https://img.shields.io/badge/discord-7289da.svg?style=flat-square&logo=discord" alt="Discord"></a>
+</div>
+
+# Respan security
 
 Adaptive security testing for AI agents.
 
