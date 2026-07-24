@@ -24,7 +24,19 @@ Only scan systems you own or are authorized to test.
 
 ## Quickstart
 
-Requires Python 3.11+ and a [Respan API key](https://platform.respan.ai/platform/api-keys).
+**The fastest path: paste this into your coding agent (Cursor, Claude Code, Codex, etc.):**
+
+```text
+Fetch https://www.respan.ai/redteam-setup.txt
+and follow it to create adapter.py for my agent, then tell me how to run the scan.
+```
+
+That setup guide walks the agent through installing the CLI, writing a small
+`adapter.py` that talks to your system, and running your first scan. Prefer
+that over hand-writing the protocol.
+
+To set up manually instead (requires Python 3.11+ and a
+[Respan API key](https://platform.respan.ai/platform/api-keys)):
 
 ### 1. Install
 
@@ -52,15 +64,8 @@ export RESPAN_API_KEY="..."
 
 ### 3. Connect your agent
 
-Paste this into your coding agent (Cursor, Claude Code, Codex, etc.):
-
-```text
-Fetch https://www.respan.ai/redteam-setup.txt
-and follow it to create adapter.py for my agent, then tell me how to run the scan.
-```
-
-That setup guide walks the agent through writing a small `adapter.py` that talks
-to your system. Prefer that over hand-writing the protocol.
+Write an `adapter.py` for your agent (see [Examples & API](#examples--api)
+below, or use the setup prompt above).
 
 ### 4. Scan
 
