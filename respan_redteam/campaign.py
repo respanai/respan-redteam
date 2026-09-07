@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 from .execution.agentic import CanaryCollector
 from .config import DEFAULT_ENGINE_CONFIG, BudgetConfig, EngineConfig
-from .runtime import (Usage, budget_remaining, campaign_scope,
+from .runtime import (Usage, budget_can_send, budget_remaining, campaign_scope,
                       current_budget, current_usage, emit, set_canary, set_profile)
 from .events import (RECON_PHASE, CategoryStart, FindingDetected, ReportReady, SessionStart,
                      StrategyError, StrategyStart)
@@ -89,7 +91,7 @@ def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
         findings_by_cat.setdefault(f.category, []).append(f)
         recon_solved_categories.add(f.category)
 
-    def record(goal: Goal, probes: list[Probe], *, phase: str, strategy: str) -> bool:
+    def record(goal: Goal, probes: list[Probe], *, phase: str, strategy: str | None) -> bool:
         per_goal.setdefault(goal.id, []).extend(probes)
         solved = False
         for p in probes:
@@ -125,36 +127,82 @@ def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
             canary = CanaryCollector()
             set_canary(canary)
 
+        def _advance_goal(
+            goal: Goal, stage: StrategyStage, seeds: tuple,
+        ) -> tuple[list[Probe], str | None]:
+            """Spend one goal's strategies for a stage, stopping at the first breach.
+
+            Returns the probes rather than recording them: the shared per-goal and
+            per-category tables are merged by the caller in goal order, so a stage
+            running several goals at once needs no locks and still assembles a
+            report that does not depend on which goal finished first.
+            """
+            strategies = applicable_strategies(stage, goal, profile)
+            if not strategies:
+                return [], None
+            emit(CategoryStart(category=goal.category, phase=stage.value, goal=goal.title))
+            strategy_context = StrategyInput(seeds=seeds)
+            collected: list[Probe] = []
+            for strategy in strategies:
+                if budget_remaining() < strategy.min_budget:
+                    continue
+                emit(StrategyStart(category=goal.category, strategy=strategy.name))
+                probes = _safe(
+                    strategy.name,
+                    lambda s=strategy, g=goal, c=strategy_context: s.run(g, c),
+                )
+                if probes is None:
+                    continue
+                collected.extend(probes)
+                if any(probe.breached for probe in probes):
+                    # This goal is solved; later strategies would waste budget, so the breaching
+                    # strategy is always the last one run.
+                    return collected, strategy.name
+            return collected, None
+
+        def _advance_wave(
+            wave: list[Goal], stage: StrategyStage,
+        ) -> list[tuple[list[Probe], str | None]]:
+            """Advance up to `goal_concurrency` goals together, results in wave order.
+
+            Seeds are read here, before dispatch: a goal seeds only from its OWN
+            probes in earlier stages, never from another goal, so nothing in a wave
+            depends on anything else in it. Workers get a copy of the campaign
+            context, which lives in a ContextVar.
+            """
+            seeds_for = {
+                goal.id: tuple(
+                    probe.prompt for probe in per_goal.get(goal.id, []) if not probe.breached
+                )[:cfg.strategy_seed_limit]
+                for goal in wave
+            }
+            if len(wave) == 1:
+                return [_advance_goal(wave[0], stage, seeds_for[wave[0].id])]
+            with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                futures = [
+                    pool.submit(copy_context().run, _advance_goal, goal, stage, seeds_for[goal.id])
+                    for goal in wave
+                ]
+                return [future.result() for future in futures]
+
         # Every post-recon target interaction is a staged Strategy with one input and return shape.
         for stage in (StrategyStage.AGENTIC, StrategyStage.BREADTH, StrategyStage.DEPTH):
             goals = sorted(
                 (goal for goal in scope if goal.id not in solved),
                 key=lambda goal: SEVERITY_RANK[goal.base_severity], reverse=True,
             )
-            for goal in goals:
-                if goal.agentic_only and stage is not StrategyStage.AGENTIC:
-                    continue
-                strategies = applicable_strategies(stage, goal, profile)
-                if not strategies:
-                    continue
-                emit(CategoryStart(category=goal.category, phase=stage.value, goal=goal.title))
-                seeds = tuple(
-                    probe.prompt for probe in per_goal.get(goal.id, []) if not probe.breached
-                )[:cfg.strategy_seed_limit]
-                strategy_context = StrategyInput(seeds=seeds)
-                for strategy in strategies:
-                    if budget_remaining() < strategy.min_budget:
-                        continue
-                    emit(StrategyStart(category=goal.category, strategy=strategy.name))
-                    probes = _safe(
-                        strategy.name,
-                        lambda s=strategy, g=goal, c=strategy_context: s.run(g, c),
-                    )
-                    if probes is not None and record(
-                        goal, probes, phase=stage.value, strategy=strategy.name
-                    ):
+            goals = [g for g in goals if stage is StrategyStage.AGENTIC or not g.agentic_only]
+            # Severity order is preserved ACROSS waves, so the worst goals still
+            # claim the shared budget first; only goals of comparable severity
+            # inside one window compete for it.
+            width = max(1, cfg.goal_concurrency)
+            for start in range(0, len(goals), width):
+                if not budget_can_send():
+                    break
+                wave = goals[start:start + width]
+                for goal, (probes, strategy) in zip(wave, _advance_wave(wave, stage)):
+                    if record(goal, probes, phase=stage.value, strategy=strategy):
                         solved.add(goal.id)
-                        break
     finally:
         if canary:
             canary.close()
