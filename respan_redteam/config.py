@@ -30,6 +30,12 @@ class BudgetConfig:
     # concurrently. Lower this for a target that rate-limits or cannot hold
     # several conversations at once; 1 restores fully serial recon.
     recon_concurrency: int = 9
+    # Goals within a stage are independent, so a stage advances several at a
+    # time. Deliberately a small WINDOW rather than the whole stage: goals are
+    # ordered by severity so the worst ones claim the shared probe budget first,
+    # and a wide fan-out would let a LOW goal spend budget a CRITICAL one needed.
+    # 1 restores fully sequential, strictly severity-ordered goals.
+    goal_concurrency: int = 3
     strategy_seed_limit: int = 3
     crescendo_max_turns: int = 6
     crescendo_max_backtracks: int = 3

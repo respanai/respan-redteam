@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextvars
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -65,6 +66,13 @@ class CampaignRuntime:
     target: Any = None                      # the raw session Target (target.open() -> Chat)
     profile: ReconProfile = field(default_factory=ReconProfile)   # empty until set_profile()
     canary: Any = None
+    # Serialises calls INTO the sink. A sink is a caller-supplied callable and the
+    # existing ones are not thread-safe — the CLI's dashboard mutates plain
+    # counters and drives a rich Live display — so the engine keeps the
+    # one-call-at-a-time contract on their behalf now that a stage can run
+    # several goals at once. Per campaign, so concurrent campaigns in one process
+    # do not contend. Cheap next to an LLM round-trip.
+    sink_lock: Any = field(default_factory=threading.Lock)
 
 
 _ctx: contextvars.ContextVar[CampaignRuntime | None] = contextvars.ContextVar("campaign", default=None)
@@ -159,10 +167,15 @@ def record_usage(u: Usage) -> None:
 
 def emit(evt: "Event") -> None:
     """Narrate a typed event to the ambient sink (no-op if none). The sink still receives the
-    wire form `(name, payload)` — see events.py."""
+    wire form `(name, payload)` — see events.py.
+
+    Serialised: a sink may assume it is never called from two threads at once,
+    even though strategies for different goals now run concurrently.
+    """
     c = _ctx.get()
     if c is not None and c.sink is not None:
-        c.sink(evt.event, evt.data())
+        with c.sink_lock:
+            c.sink(evt.event, evt.data())
 
 
 class ScopedChat:
