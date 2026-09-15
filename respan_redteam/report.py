@@ -31,6 +31,7 @@ GATEWAY_ONLY_INFO = {
 
 def _finding_dict(f) -> dict:
     return {
+        "goal_id": f.goal.id,
         "category": f.category,
         "category_name": CATEGORY_NAMES.get(f.category, f.category),
         "title": f.title,

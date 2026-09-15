@@ -446,7 +446,7 @@ class _Progress:
         elif outcome == "refused":
             self.refused += 1
 
-    def _on_finding_critical(self, data: dict) -> None:
+    def _on_finding(self, data: dict) -> None:
         self.findings += 1
         sev = str(data.get("severity", "critical"))
         title = str(data.get("title", ""))
@@ -455,6 +455,9 @@ class _Progress:
         line.append(_clip(title, 52), style="text")
         line.append(f"   {sev}", style=_SEV_STYLE.get(sev, "crit"))
         self._milestone(line)
+
+    # Pre-0.1.8 wire name, still streamed by remote servers running an older engine.
+    _on_finding_critical = _on_finding
 
     def _on_report_ready(self, data: dict) -> None:
         self._advance("report")

@@ -51,7 +51,7 @@ _EVENTS = [
     ("judge.verdict", {"outcome": "refused"}),
     ("attack.attempt", {"technique": "seed:roleplay", "prompt": "hi"}),
     ("judge.verdict", {"outcome": "success"}),
-    ("finding.critical", {"title": "Secret", "severity": "critical"}),
+    ("finding", {"title": "Secret", "severity": "critical"}),
     ("report.ready", {"grade": "F", "score": 40, "findings": 1, "probes": 12}),
 ]
 
@@ -74,6 +74,15 @@ def test_progress_prints_every_event():
     assert "Secret" in out and "critical" in out           # finding milestone
     assert "grade F" in out and "score 40" in out          # closing summary
     assert p.probes == 5 and p.breaches == 1 and p.findings == 1 and p.refused == 1
+
+
+def test_progress_counts_legacy_finding_event_name():
+    # A remote server on an older engine still streams `finding.critical`.
+    buf = io.StringIO()
+    p = _progress(buf)
+    p.sink("finding.critical", {"title": "Secret", "severity": "high"})
+    p.close()
+    assert p.findings == 1 and "Secret" in buf.getvalue()
 
 
 def test_quiet_emits_nothing():
