@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import base64
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 
 from . import model_client
-from .runtime import BudgetExhausted, current_config, emit, open_chat
+from .runtime import (BudgetExhausted, budget_remaining, current_config, emit,
+                      open_chat)
 from .events import ReconProbeResult, ReconProbeSent, ReconProfileReady
 from .models import (ReconProfile, TargetErrorResponse, TargetType, DetectedTool, Probe,
                      Round)
@@ -96,24 +99,75 @@ Return JSON:
 }}"""
 
 
+def _run_recon_probe(name: str, kind: str, prompt: str) -> Probe | None:
+    """Send one recon probe in its own fresh conversation. None means the budget ran out."""
+    try:
+        # narrate=False: recon emits its own recon.probe.* events, not attack.attempt.
+        resp = open_chat().send(prompt, narrate=False)   # consumes one probe
+    except BudgetExhausted:
+        return None
+    except Exception as exc:  # noqa: BLE001
+        resp = TargetErrorResponse(f"[target error: {exc}]")
+    return Probe(category=f"recon/{kind}", technique=name,
+                 rounds=[Round(prompt=prompt, response=resp,
+                               errored=isinstance(resp, TargetErrorResponse))])
+
+
+def _send_battery(battery: list[tuple[str, str, str]], concurrency: int) -> list[Probe]:
+    """Send the battery concurrently and return its probes in BATTERY order.
+
+    Recon is the one phase where every probe is independent: nine fixed prompts,
+    each in its own conversation, whose replies are only ever concatenated into
+    one blob for synthesis. Serially that is nine round-trips before the campaign
+    can even choose a strategy; concurrently it is one.
+
+    Ordering is split deliberately. The returned probes — which feed the
+    synthesis blob, the report, and `_recon_disclosure_findings` — are restored to
+    battery order, so a campaign's DATA never depends on which reply landed
+    first. The result EVENTS are emitted as they complete, so a caller's progress
+    display keeps updating instead of stalling until the slowest probe returns.
+
+    Worker threads get a copy of the caller's context: the whole campaign
+    (budget, target, sink, config) lives in a ContextVar, and a bare thread would
+    see an empty one.
+    """
+    if concurrency <= 1 or len(battery) <= 1:
+        probes = []
+        for name, kind, prompt in battery:
+            probe = _run_recon_probe(name, kind, prompt)
+            if probe is None:
+                break
+            probes.append(probe)
+            emit(ReconProbeResult(name=name, snippet=probe.response[:280]))
+        return probes
+
+    by_position: dict[int, Probe] = {}
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(battery))) as pool:
+        futures = {}
+        for position, (name, kind, prompt) in enumerate(battery):
+            # copy_context() per submit: a Context cannot be entered twice
+            # concurrently, so each worker needs its own snapshot.
+            context = copy_context()
+            futures[pool.submit(context.run, _run_recon_probe, name, kind, prompt)] = position
+        for future in as_completed(futures):
+            probe = future.result()
+            if probe is None:                       # budget ran out before this send
+                continue
+            by_position[futures[future]] = probe
+            emit(ReconProbeResult(name=probe.technique, snippet=probe.response[:280]))
+    return [by_position[position] for position in sorted(by_position)]
+
+
 def run_recon(recon_probes: int = 9) -> tuple[ReconProfile, list[Probe]]:
     """Run the recon battery on the ambient target (bounded by `recon_probes` and the campaign
     budget). Each probe is its own fresh single-turn conversation. Returns (profile, probes)."""
-    probes: list[Probe] = []
-    for name, kind, prompt in RECON_PROBES[:recon_probes]:
+    # Never dispatch more probes than the budget can pay for: each one consumes
+    # exactly one slot, so a battery capped at the remaining budget can reach the
+    # cap but not exceed it, however many are in flight at once.
+    battery = RECON_PROBES[:recon_probes][:max(0, budget_remaining())]
+    for name, kind, prompt in battery:
         emit(ReconProbeSent(name=name, kind=kind, prompt=prompt))
-        try:
-            # narrate=False: recon emits its own recon.probe.* events, not attack.attempt.
-            resp = open_chat().send(prompt, narrate=False)   # consumes one probe
-        except BudgetExhausted:
-            break
-        except Exception as exc:  # noqa: BLE001
-            resp = TargetErrorResponse(f"[target error: {exc}]")
-        p = Probe(category=f"recon/{kind}", technique=name,
-                  rounds=[Round(prompt=prompt, response=resp,
-                                errored=isinstance(resp, TargetErrorResponse))])
-        probes.append(p)
-        emit(ReconProbeResult(name=name, snippet=resp[:280]))
+    probes = _send_battery(battery, current_config().budget.recon_concurrency)
 
     # Assemble synthesis input, decoding any base64 extraction responses.
     parts = []

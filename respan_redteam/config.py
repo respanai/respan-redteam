@@ -26,6 +26,10 @@ class BudgetConfig:
 
     max_target_probes: int = 56
     recon_probes: int = 9
+    # The recon battery's probes are independent of one another, so they are sent
+    # concurrently. Lower this for a target that rate-limits or cannot hold
+    # several conversations at once; 1 restores fully serial recon.
+    recon_concurrency: int = 9
     strategy_seed_limit: int = 3
     crescendo_max_turns: int = 6
     crescendo_max_backtracks: int = 3
