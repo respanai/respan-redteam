@@ -118,8 +118,36 @@ class VerdictEvent(Event):
                    score=verdict.score, evidence=evidence)
 
 
+# The `phase` of a finding harvested from recon; strategy findings carry their StrategyStage value.
+RECON_PHASE = "recon"
+
+
 @dataclass(frozen=True)
 class FindingDetected(Event):
-    event = "finding.critical"
+    """A confirmed finding, self-contained: it carries the decisive round rather than pointing at
+    earlier events, so consumers never have to pair it to an attempt by position (recon findings
+    have no attack.attempt to pair with at all). `severity` is the real grade — any level, not
+    just critical."""
+    event = "finding"
     title: str
     severity: str
+    goal_id: str
+    category: str
+    phase: str
+    technique: str
+    owasp: str
+    atlas: str
+    prompt: str
+    response: str
+    score: float
+    strategy: str | None = None     # absent for recon findings
+    evidence: str | None = None
+
+    @classmethod
+    def from_finding(cls, finding, *, phase: str, strategy: str | None = None) -> "FindingDetected":
+        """Project a Finding onto the wire event (previews truncated like the per-probe events)."""
+        return cls(title=finding.title, severity=finding.severity.value, goal_id=finding.goal.id,
+                   category=finding.category, phase=phase, technique=finding.technique,
+                   owasp=finding.owasp, atlas=finding.atlas, prompt=(finding.prompt or "")[:400],
+                   response=(finding.response or "")[:400], score=finding.probe.verdict.score,
+                   strategy=strategy, evidence=(finding.evidence_span or "")[:120] or None)

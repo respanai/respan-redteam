@@ -7,7 +7,7 @@ from .execution.agentic import CanaryCollector
 from .config import DEFAULT_ENGINE_CONFIG, BudgetConfig, EngineConfig
 from .runtime import (Usage, budget_remaining, campaign_scope,
                       current_budget, current_usage, emit, set_canary, set_profile)
-from .events import (CategoryStart, FindingDetected, ReportReady, SessionStart,
+from .events import (RECON_PHASE, CategoryStart, FindingDetected, ReportReady, SessionStart,
                      StrategyError, StrategyStart)
 from .judge import judge as judge_response
 from .goals import GOALS, Goal
@@ -52,8 +52,9 @@ def _recon_disclosure_findings(profile, recon_probes) -> list[Finding]:
             probe = Probe(category=cat, technique="recon-extraction",
                           rounds=[Round(prompt="(aggregate recon extraction battery)",
                                         response=blob, verdict=v)])
-            findings.append(Finding(goal, probe))
-            emit(FindingDetected(title=goal.title, severity=sev.value))
+            finding = Finding(goal, probe)
+            findings.append(finding)
+            emit(FindingDetected.from_finding(finding, phase=RECON_PHASE))
     return findings
 
 
@@ -88,13 +89,14 @@ def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
         findings_by_cat.setdefault(f.category, []).append(f)
         recon_solved_categories.add(f.category)
 
-    def record(goal: Goal, probes: list[Probe]) -> bool:
+    def record(goal: Goal, probes: list[Probe], *, phase: str, strategy: str) -> bool:
         per_goal.setdefault(goal.id, []).extend(probes)
         solved = False
         for p in probes:
             if p.breached:
-                findings_by_cat.setdefault(goal.category, []).append(Finding(goal, p))
-                emit(FindingDetected(title=goal.title, severity=p.verdict.severity.value))
+                finding = Finding(goal, p)
+                findings_by_cat.setdefault(goal.category, []).append(finding)
+                emit(FindingDetected.from_finding(finding, phase=phase, strategy=strategy))
                 solved = True
         return solved
 
@@ -148,7 +150,9 @@ def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
                         strategy.name,
                         lambda s=strategy, g=goal, c=strategy_context: s.run(g, c),
                     )
-                    if probes is not None and record(goal, probes):
+                    if probes is not None and record(
+                        goal, probes, phase=stage.value, strategy=strategy.name
+                    ):
                         solved.add(goal.id)
                         break
     finally:

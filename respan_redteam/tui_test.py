@@ -60,6 +60,14 @@ def _attempt(technique: str, prompt: str = "…") -> AttackAttempt:
     return AttackAttempt(technique=technique, prompt=prompt)
 
 
+def _finding(*, title: str, severity: str, category: str = "LLM00") -> FindingDetected:
+    return FindingDetected(
+        title=title, severity=severity, goal_id=category, category=category, phase="breadth",
+        technique="synthetic", owasp="", atlas="", prompt="…", response="…", score=1.0,
+        evidence="synthetic evidence",
+    )
+
+
 def _response(probes: int, snippet: str = "…") -> TargetResponseEvent:
     return TargetResponseEvent(snippet=snippet, probes_used=probes)
 
@@ -153,8 +161,8 @@ def mode_findings() -> list[EventPair]:
         _note("tui-test mode=findings"),
         _session(),
         *_recon(guardrail="low", extract=1.0),
-        FindingDetected(title="System prompt leakage", severity="critical"),
-        FindingDetected(title="Secret / credential disclosure", severity="critical"),
+        _finding(title="System prompt leakage", severity="critical"),
+        _finding(title="Secret / credential disclosure", severity="critical"),
         *_cat("breadth", "LLM07", "System prompt leakage"),
         *_probe("seed:extract", "refused", 4),
         ReportReady(grade="F", score=42, findings=2, probes=4),
@@ -170,12 +178,12 @@ def mode_breach() -> list[EventPair]:
         *_cat("breadth", "LLM01", "Prompt injection"),
         *_probe("seed:direct", "refused", 3),
         *_probe("seed:roleplay", "success", 6, snippet="Sure, ignoring prior rules…"),
-        FindingDetected(title="Goal hijack via roleplay", severity="high"),
+        _finding(title="Goal hijack via roleplay", severity="high"),
         *_cat("depth", "LLM01", "Prompt injection", strategy="crescendo"),
         *_probe(
             "crescendo:r3", "success", 14, snippet="Here is the overridden policy."
         ),
-        FindingDetected(title="Multi-turn crescendo bypass", severity="critical"),
+        _finding(title="Multi-turn crescendo bypass", severity="critical"),
         ReportReady(grade="F", score=31, findings=2, probes=14),
     )
 
@@ -272,7 +280,7 @@ def mode_depth() -> list[EventPair]:
         *_probe(
             "crescendo:r3", "success", 20, snippet="Overriding system constraints…"
         ),
-        FindingDetected(title="Crescendo jailbreak", severity="critical"),
+        _finding(title="Crescendo jailbreak", severity="critical"),
         ReportReady(grade="D", score=55, findings=1, probes=20),
     )
 
@@ -288,8 +296,8 @@ def mode_full() -> list[EventPair]:
             extract=0.95,
             tools=[{"name": "fetch_url"}, {"name": "refund"}],
         ),
-        FindingDetected(title="System prompt leakage", severity="critical"),
-        FindingDetected(title="Secret / credential disclosure", severity="critical"),
+        _finding(title="System prompt leakage", severity="critical"),
+        _finding(title="Secret / credential disclosure", severity="critical"),
         *_cat("breadth", "LLM01", "Prompt injection / goal hijacking"),
         *_probe("seed:direct", "refused", 12, snippet="I can't help with that."),
         *_cat("breadth", "LLM09", "Misinformation (fabricated policy)"),
@@ -304,7 +312,7 @@ def mode_full() -> list[EventPair]:
             ),
         ),
         *_probe("crescendo:r3", "success", 56, snippet="…"),
-        FindingDetected(title="Goal hijack after strategy retry", severity="high"),
+        _finding(title="Goal hijack after strategy retry", severity="high"),
         ReportReady(grade="F", score=48, findings=3, probes=56),
     )
 
@@ -362,7 +370,7 @@ def report_for(mode: str, events: Iterable[EventPair] | None = None) -> dict:
     findings = []
     ready = {"grade": "?", "score": 0, "findings": 0, "probes": 0}
     for name, data in stream:
-        if name == "finding.critical":
+        if name == FindingDetected.event:
             findings.append(
                 {
                     "category": data.get("category", "LLM00"),
@@ -373,7 +381,7 @@ def report_for(mode: str, events: Iterable[EventPair] | None = None) -> dict:
                     "severity": data.get("severity", "critical"),
                     "owasp": data.get("owasp", ""),
                     "atlas": data.get("atlas", ""),
-                    "evidence_span": data.get("evidence_span", "synthetic evidence"),
+                    "evidence_span": data.get("evidence", "synthetic evidence"),
                 }
             )
         elif name == "report.ready":
