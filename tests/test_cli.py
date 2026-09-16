@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
-from respan_redteam.cli import (_Progress, _CLI_THEME, _auth_main, _build_local_engine_config, _campaign_url,
+from respan_redteam.cli import (ScanRejected, _Progress, _CLI_THEME, _auth_main, _build_local_engine_config, _campaign_url,
                                 _connect, _error, _explain,
                                 _load_adapter, _open_adapter, _required,
                                 _retryable_connection_error, _scan_main, _server_to_ws_url,
@@ -527,6 +527,75 @@ def test_local_profile_resets_unspecified_models_to_built_in_defaults():
     with patch.dict(os.environ, {"RESPAN_MODEL_ATTACKER": "ignored"}, clear=True):
         config = _build_local_engine_config(ProfileConfig(name="local", mode="local"))
         assert config.llm.model_attacker == "gpt-4.1"
+
+
+def _server_close(code: int):
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+    return ConnectionClosedError(Close(code, ""), Close(code, ""), True)
+
+
+def test_explain_names_server_refusal_close_codes():
+    assert "not enabled" in _explain(_server_close(4403))
+    assert "authentication failed" in _explain(_server_close(4401))
+    assert "busy" in _explain(_server_close(4503))
+
+
+def test_validate_api_key_raises_scan_rejected_on_refusal_close():
+    async def run():
+        connection = AsyncMock()
+        connection.recv.side_effect = _server_close(4401)
+        with patch("respan_redteam.cli._connect", new=AsyncMock(return_value=connection)):
+            try:
+                await _validate_api_key(DEFAULT_URL, "secret")
+            except ScanRejected as exc:
+                assert exc.code == 4401
+            else:
+                raise AssertionError("expected ScanRejected")
+        connection.close.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+def test_auth_login_saves_key_but_warns_when_red_teaming_disabled():
+    stderr = io.StringIO()
+    with patch("respan_redteam.cli._prompt_api_key", return_value="secret-key"), \
+         patch("respan_redteam.cli._validate_api_key",
+               new=AsyncMock(side_effect=ScanRejected(4403))), \
+         patch("respan_redteam.cli.save_api_key") as save, \
+         redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+        assert _auth_main(["login", "--ws-url", DEFAULT_URL]) == 0
+    save.assert_called_once_with(DEFAULT_URL, "secret-key")
+    assert "not enabled" in stderr.getvalue()
+
+
+def test_auth_login_rejects_key_refused_with_4401():
+    stderr = io.StringIO()
+    with patch("respan_redteam.cli._prompt_api_key", return_value="bad-key"), \
+         patch("respan_redteam.cli._validate_api_key",
+               new=AsyncMock(side_effect=ScanRejected(4401))), \
+         patch("respan_redteam.cli.save_api_key") as save, redirect_stderr(stderr):
+        assert _auth_main(["login", "--ws-url", DEFAULT_URL]) == 2
+    save.assert_not_called()
+    assert "auth login" in stderr.getvalue()
+
+
+def test_remote_scan_reports_refusal_instead_of_raw_close():
+    from respan_redteam.cli import _run_remote
+
+    async def run():
+        ws = AsyncMock()
+        ws.__aiter__.side_effect = _server_close(4403)
+        stderr = io.StringIO()
+        with patch("respan_redteam.cli._connect", new=AsyncMock(return_value=ws)), \
+             redirect_stderr(stderr):
+            code = await _run_remote(DEFAULT_URL, "secret", object(), "text", None, 1, 1.0, 1.0,
+                                     1, _Progress(quiet=True))
+        assert code == 2
+        assert "refused the scan" in stderr.getvalue()
+        assert "enable red teaming" in stderr.getvalue()
+
+    asyncio.run(run())
 
 
 def main():

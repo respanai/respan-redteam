@@ -138,9 +138,54 @@ def _load_adapter(path: str, symbol: str | None = None):
     return tgt
 
 
+# Application close codes the server sends when it refuses a scan. The server accepts the
+# handshake before closing so these codes survive (a pre-accept close becomes a bare HTTP 403).
+_AUTH_REJECTION_GRACE_SECONDS = 2.0
+_CLOSE_AUTH_REQUIRED = 4401
+_CLOSE_FORBIDDEN = 4403
+_CLOSE_HELLO_TIMEOUT = 4408
+_CLOSE_RATE_LIMITED = 4429
+_CLOSE_BUSY = 4503
+_CLOSE_REASONS = {
+    _CLOSE_AUTH_REQUIRED: "authentication failed — the API key is missing or invalid",
+    _CLOSE_FORBIDDEN: "red teaming is not enabled for this project",
+    _CLOSE_HELLO_TIMEOUT: "the server timed out waiting for the scan to start",
+    _CLOSE_RATE_LIMITED: "campaign rate limit or monthly allowance exceeded",
+    _CLOSE_BUSY: "the red-team service is busy or temporarily unavailable",
+}
+_CLOSE_HINTS = {
+    _CLOSE_AUTH_REQUIRED: "Run `respan-redteam auth login` or check RESPAN_API_KEY.",
+    _CLOSE_FORBIDDEN: "Ask a Respan admin to enable red teaming for the project this API key "
+                      "belongs to.",
+    _CLOSE_HELLO_TIMEOUT: "Retry; if it persists, check that your adapter loads quickly.",
+    _CLOSE_RATE_LIMITED: "Wait before launching another scan, or contact Respan to raise the limit.",
+    _CLOSE_BUSY: "Retry in a few minutes.",
+}
+
+
+def _server_close_code(exc: BaseException) -> int | None:
+    """The close code the server sent, if `exc` is a server-initiated WebSocket close."""
+    import websockets.exceptions as we
+    if isinstance(exc, we.ConnectionClosed) and exc.rcvd is not None:
+        return exc.rcvd.code
+    return None
+
+
+class ScanRejected(RuntimeError):
+    """The server closed the socket with a known refusal code."""
+
+    def __init__(self, code: int):
+        super().__init__(f"{_CLOSE_REASONS[code]} (close code {code})")
+        self.code = code
+        self.hint = _CLOSE_HINTS[code]
+
+
 def _explain(exc: BaseException) -> str:
     """Human-readable one-liner for a connection or engine failure (no traceback)."""
     import websockets.exceptions as we
+    code = _server_close_code(exc)
+    if code in _CLOSE_REASONS:
+        return f"{_CLOSE_REASONS[code]} (close code {code})"
     if isinstance(exc, we.InvalidStatus):
         status = getattr(exc.response, "status_code", "?")
         if status in (401, 403):
@@ -372,6 +417,10 @@ async def _run_remote(ws_url: str, api_key: str, target, output_format: str, out
                 raise RuntimeError(f"remote engine sent unknown operation {op!r}")
     except websockets.ConnectionClosed as exc:
         prog.close()
+        code = _server_close_code(exc)
+        if code in _CLOSE_REASONS:
+            _error("the server refused the scan", exc, hint=_CLOSE_HINTS[code])
+            return 2
         _error("lost connection to the remote engine mid-campaign", exc,
                hint="The campaign cannot safely replay agent actions; start a new run.")
         return 3
@@ -412,7 +461,20 @@ async def _validate_api_key(ws_url: str, api_key: str) -> None:
         timeout=15,
         prog=_Progress(quiet=True),
     )
-    await connection.close()
+    import websockets
+    try:
+        # The server completes the handshake even for a bad key, then closes with a refusal
+        # code right away. A socket still open after the grace window was accepted.
+        await asyncio.wait_for(connection.recv(), _AUTH_REJECTION_GRACE_SECONDS)
+    except TimeoutError:
+        pass
+    except websockets.ConnectionClosed as exc:
+        code = _server_close_code(exc)
+        if code in _CLOSE_REASONS:
+            raise ScanRejected(code) from exc
+        raise
+    finally:
+        await connection.close()
 
 
 def _prompt_api_key(prompt: str = "Respan API key: ") -> str:
@@ -544,8 +606,15 @@ def _auth_main(argv: list[str]) -> int:
         if not api_key:
             print("error: API key cannot be empty", file=sys.stderr)
             return 2
+        is_red_teaming_enabled = True
         try:
             asyncio.run(_validate_api_key(ws_url, api_key))
+        except ScanRejected as exc:
+            # 4403 means the key authenticated but its project lacks access: keep the key.
+            if exc.code != _CLOSE_FORBIDDEN:
+                _error("could not authenticate", exc, hint=exc.hint)
+                return 2
+            is_red_teaming_enabled = False
         except Exception as exc:  # noqa: BLE001 -- auth/network errors are user-facing.
             _error("could not authenticate", exc, hint="Check the key and hosted engine URL.")
             return 2
@@ -564,6 +633,12 @@ def _auth_main(argv: list[str]) -> int:
                 return 2
             location = f"credentials file ({credentials_path()})"
         print(f"Authenticated. API key saved in the {location}.")
+        if not is_red_teaming_enabled:
+            _error(
+                "scans will be refused",
+                ScanRejected(_CLOSE_FORBIDDEN),
+                hint=_CLOSE_HINTS[_CLOSE_FORBIDDEN],
+            )
         return 0
 
     if args.command == "status":
