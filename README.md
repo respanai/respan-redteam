@@ -93,8 +93,10 @@ Run `respan-redteam <command> --help` for options.
 
 By default the attack engine runs on Respan (`https://api.respan.ai`). Your
 adapter stays on your machine and only exchanges user messages / replies. If the
-connection drops mid-scan, the CLI reconnects and resumes the same campaign for
-up to two minutes.
+connection drops mid-scan, the CLI reconnects and resumes the same campaign. If
+the CLI itself stops (crash, Ctrl-C, closed terminal), running the same scan
+again within 30 minutes picks the campaign up from its last finished goal; pass
+`--new` to start over instead.
 
 ```bash
 export OPENAI_API_KEY="..."
