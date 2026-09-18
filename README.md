@@ -92,7 +92,9 @@ Run `respan-redteam <command> --help` for options.
 ## Hosted vs local
 
 By default the attack engine runs on Respan (`https://api.respan.ai`). Your
-adapter stays on your machine and only exchanges user messages / replies.
+adapter stays on your machine and only exchanges user messages / replies. If the
+connection drops mid-scan, the CLI reconnects and resumes the same campaign for
+up to two minutes.
 
 ```bash
 export OPENAI_API_KEY="..."
