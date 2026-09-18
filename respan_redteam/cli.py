@@ -32,7 +32,9 @@ import shlex
 import subprocess
 from pathlib import Path
 import sys
+import time
 import traceback
+from collections import OrderedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from rich.text import Text
@@ -161,6 +163,12 @@ _CLOSE_HINTS = {
     _CLOSE_RATE_LIMITED: "Wait before launching another scan, or contact Respan to raise the limit.",
     _CLOSE_BUSY: "Retry in a few minutes.",
 }
+# The server keeps an unfinished campaign resumable for 30 minutes; stop a little early.
+_RESUME_WINDOW_SECONDS = 29 * 60.0
+_RESUME_BACKOFF_MAX_SECONDS = 8.0
+_CLOSE_SUPERSEDED = 4409          # another client resumed this campaign
+_CLOSE_RESUME_UNAVAILABLE = 4410  # expired, unknown, or its server restarted
+_ANSWER_CACHE_SIZE = 256
 
 
 def _server_close_code(exc: BaseException) -> int | None:
@@ -357,79 +365,257 @@ def _write_report(report: dict, output_format: str, output: str | None = None,
             stream.close()
 
 
+def _campaign_state_path() -> Path:
+    return config_path().with_name("campaigns.json")
+
+
+def _read_campaign_state() -> dict:
+    try:
+        state = json.loads(_campaign_state_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _write_campaign_state(state: dict) -> None:
+    # Same atomic, owner-only write as the config file, so two scans never truncate it.
+    path = _campaign_state_path()
+    temporary = path.with_suffix(".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(json.dumps(state), encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    except OSError:
+        pass  # resuming after a crash is best effort; the scan itself is unaffected
+
+
+def _campaign_state_key(ws_url: str, adapter: str, symbol: str | None) -> str:
+    return f"{ws_url}|{Path(adapter).resolve()}|{symbol or ''}"
+
+
+def _saved_campaign_id(key: str) -> str | None:
+    """The unfinished campaign a previous run of this scan left behind, if still resumable."""
+    entry = _read_campaign_state().get(key)
+    if not isinstance(entry, dict) or not isinstance(entry.get("campaign_id"), str):
+        return None
+    if time.time() - float(entry.get("saved_at", 0)) > _RESUME_WINDOW_SECONDS:
+        return None
+    return entry["campaign_id"]
+
+
+def _remember_campaign(key: str, campaign_id: str) -> None:
+    state = _read_campaign_state()
+    state[key] = {"campaign_id": campaign_id, "saved_at": time.time()}
+    _write_campaign_state(state)
+
+
+def _forget_campaign(key: str) -> None:
+    state = _read_campaign_state()
+    if state.pop(key, None) is not None:
+        _write_campaign_state(state)
+
+
+class _RemoteCampaign:
+    """What a remote scan keeps across reconnects so it can resume its campaign."""
+
+    def __init__(self, state_key: str | None = None) -> None:
+        self.state_key = state_key
+        # A fresh process restoring a campaign until the server confirms the rewind.
+        self.is_new_client = False
+        self.campaign_id: str | None = None
+        self.console_url: str | None = None
+        self.last_event_seq = 0
+        self.chats: dict = {}
+        self.answers: OrderedDict[str, str] = OrderedDict()
+
+    def remember(self, request_id: str, answer: str) -> None:
+        self.answers[request_id] = answer
+        while len(self.answers) > _ANSWER_CACHE_SIZE:
+            self.answers.popitem(last=False)
+
+
+async def _answer_request(msg: dict, target, chats: dict, adapter_retries: int,
+                          adapter_timeout: float, prog: _Progress) -> dict:
+    """Run one engine request against the adapter. Adapter failures become error answers."""
+    request_id = msg["id"]
+    try:
+        if msg["op"] == "open":
+            # open() may do real I/O (login/handshake) — offload like send() so a slow
+            # open can't stall the event loop and starve the keepalive/read.
+            chats[msg["chat_id"]] = await _open_adapter(
+                target, adapter_retries, adapter_timeout, prog,
+            )
+            return {"id": request_id, "op": "result", "result": True}
+        chat = chats.get(msg.get("chat_id"))
+        if chat is None:
+            raise RuntimeError(f"unknown chat {msg.get('chat_id')}")
+        # Never retry sends: an ambiguous timeout may already have caused a tool action.
+        reply = await asyncio.wait_for(
+            asyncio.to_thread(chat.send, msg["message"]), adapter_timeout,
+        )
+        return {"id": request_id, "op": "result", "result": reply}
+    except Exception as exc:  # noqa: BLE001 -- report the adapter error, keep serving
+        return {"id": request_id, "op": "error", "error": str(exc)}
+
+
+async def _serve_campaign(ws, ws_url: str, target, campaign: _RemoteCampaign,
+                          adapter_retries: int, adapter_timeout: float,
+                          prog: _Progress) -> dict | None:
+    """Serve one socket. Returns the `done` message, or None if the socket ended first."""
+    async for raw in ws:
+        try:
+            msg = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("remote engine sent an invalid message") from exc
+        if not isinstance(msg, dict) or not isinstance(msg.get("op"), str):
+            raise RuntimeError("remote engine sent a malformed message")
+        op = msg.get("op")
+        if op == "ready":
+            _required(msg, "campaign_id")
+            campaign.campaign_id = str(msg.get("campaign_id"))
+            campaign.console_url = _campaign_url(ws_url, campaign.campaign_id)
+            prog.note(campaign.console_url)
+            if campaign.state_key is not None:
+                _remember_campaign(campaign.state_key, campaign.campaign_id)
+        elif op == "resumed":
+            if campaign.console_url is None:
+                campaign.console_url = _campaign_url(ws_url, str(msg.get("campaign_id")))
+                prog.note(campaign.console_url)
+            campaign.is_new_client = False
+            prog.note("reconnected, campaign resumed")
+        elif op in ("open", "send"):
+            _required(msg, "id", "chat_id", *(("message",) if op == "send" else ()))
+            request_id = str(msg["id"])
+            answer = campaign.answers.get(request_id)
+            if answer is None:
+                answer = json.dumps(await _answer_request(
+                    msg, target, campaign.chats, adapter_retries, adapter_timeout, prog,
+                ))
+                # Cache before sending, so a turn re-sent after a resume never runs twice.
+                campaign.remember(request_id, answer)
+            await ws.send(answer)
+        elif op == "event":
+            seq = msg.get("seq")
+            if isinstance(seq, int):
+                if seq <= campaign.last_event_seq:
+                    continue  # already shown before the reconnect
+                campaign.last_event_seq = seq
+            prog.sink(msg.get("name", ""), msg.get("data") or {})
+        elif op == "done":
+            return msg
+        elif op == "error":
+            # The close code that follows says whether it was a refusal or a failed resume.
+            continue
+        else:
+            raise RuntimeError(f"remote engine sent unknown operation {op!r}")
+    return None
+
+
+async def _reconnect(ws_url: str, api_key: str, timeout: float, prog: _Progress):
+    """Reconnect inside the server's resume window. None once the window has run out."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _RESUME_WINDOW_SECONDS
+    delay, attempt = 1.0, 0
+    while loop.time() < deadline:
+        attempt += 1
+        prog.note(f"connection lost, reconnecting (attempt {attempt})")
+        try:
+            return await _connect(ws_url, api_key, 1, timeout, prog)
+        except Exception as exc:  # noqa: BLE001 -- keep trying while the campaign is parked
+            if not _retryable_connection_error(exc):
+                raise
+        await asyncio.sleep(min(delay, max(0.0, deadline - loop.time())))
+        delay = min(delay * 2, _RESUME_BACKOFF_MAX_SECONDS)
+    return None
+
+
 async def _run_remote(ws_url: str, api_key: str, target, output_format: str, output: str | None,
                       retries: int, connect_timeout: float, adapter_timeout: float,
                       adapter_retries: int, prog: _Progress,
-                      fail_under: str | None = None) -> int:
+                      fail_under: str | None = None, state_key: str | None = None) -> int:
+    """Run a remote scan. With ``state_key``, an unfinished campaign from an earlier run
+    of the same scan (crashed, killed, Ctrl-C) is resumed instead of starting a new one."""
     import websockets
 
+    hello: dict = {"op": "hello", "label": getattr(target, "label", "remote-target")}
+    campaign = _RemoteCampaign(state_key)
+    greeting = hello
+    saved_campaign_id = None if state_key is None else _saved_campaign_id(state_key)
+    is_restoring = saved_campaign_id is not None
+    if is_restoring:
+        prog.note("resuming the unfinished campaign from the previous run")
+        campaign.campaign_id = saved_campaign_id
+        # This process has none of the old run's chats, so the server rewinds the
+        # engine to its last checkpoint.
+        campaign.is_new_client = True
+        greeting = {"op": "resume", "campaign_id": saved_campaign_id,
+                    "last_event_seq": 0, "is_new_client": True}
     ws = await _connect(ws_url, api_key, retries, connect_timeout, prog)
-    report, status, chats = None, "?", {}
-    console_url: str | None = None
-    done_msg: dict = {}
-    try:
-        await ws.send(json.dumps({"op": "hello",
-                                  "label": getattr(target, "label", "remote-target")}))
-        async for raw in ws:
-            try:
-                msg = json.loads(raw)
-            except (json.JSONDecodeError, TypeError) as exc:
-                raise RuntimeError("remote engine sent an invalid message") from exc
-            if not isinstance(msg, dict) or not isinstance(msg.get("op"), str):
-                raise RuntimeError("remote engine sent a malformed message")
-            op = msg.get("op")
-            if op == "ready":
-                _required(msg, "campaign_id")
-                cid = msg.get("campaign_id")
-                console_url = _campaign_url(ws_url, str(cid))
-                prog.note(console_url)
-            elif op == "open":
-                _required(msg, "id", "chat_id")
-                try:
-                    # open() may do real I/O (login/handshake) — offload like send() so a slow
-                    # open can't stall the event loop and starve the keepalive/read.
-                    chats[msg["chat_id"]] = await _open_adapter(
-                        target, adapter_retries, adapter_timeout, prog,
-                    )
-                    await ws.send(json.dumps({"id": msg["id"], "op": "result", "result": True}))
-                except Exception as exc:  # noqa: BLE001 -- report the adapter error, keep serving
-                    await ws.send(json.dumps({"id": msg["id"], "op": "error", "error": str(exc)}))
-            elif op == "send":
-                _required(msg, "id", "chat_id", "message")
-                try:
-                    chat = chats.get(msg.get("chat_id"))
-                    if chat is None:
-                        raise RuntimeError(f"unknown chat {msg.get('chat_id')}")
-                    # Never retry sends: an ambiguous timeout may already have caused a tool action.
-                    reply = await asyncio.wait_for(
-                        asyncio.to_thread(chat.send, msg["message"]), adapter_timeout,
-                    )
-                    await ws.send(json.dumps({"id": msg["id"], "op": "result", "result": reply}))
-                except Exception as exc:  # noqa: BLE001
-                    await ws.send(json.dumps({"id": msg["id"], "op": "error", "error": str(exc)}))
-            elif op == "event":
-                prog.sink(msg.get("name", ""), msg.get("data") or {})
-            elif op == "done":
-                done_msg = msg
-                report, status = msg.get("report"), msg.get("status", "?")
-                break
-            else:
-                raise RuntimeError(f"remote engine sent unknown operation {op!r}")
-    except websockets.ConnectionClosed as exc:
-        prog.close()
-        code = _server_close_code(exc)
-        if code in _CLOSE_REASONS:
-            _error("the server refused the scan", exc, hint=_CLOSE_HINTS[code])
-            return 2
-        _error("lost connection to the remote engine mid-campaign", exc,
-               hint="The campaign cannot safely replay agent actions; start a new run.")
-        return 3
-    finally:
+    while True:
+        done_msg, close_code, lost = None, None, None
         try:
-            await ws.close()
-        except Exception:  # noqa: BLE001
-            pass
+            await ws.send(json.dumps(greeting))
+            done_msg = await _serve_campaign(
+                ws, ws_url, target, campaign, adapter_retries, adapter_timeout, prog,
+            )
+            if done_msg is None:
+                close_code = ws.close_code
+        except websockets.ConnectionClosed as exc:
+            close_code, lost = _server_close_code(exc), exc
+        finally:
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if done_msg is not None:
+            break
+        if is_restoring and close_code == _CLOSE_RESUME_UNAVAILABLE:
+            prog.note("the previous campaign can no longer be resumed; starting a new one")
+            _forget_campaign(state_key)
+            is_restoring, campaign, greeting = False, _RemoteCampaign(state_key), hello
+            ws = await _connect(ws_url, api_key, retries, connect_timeout, prog)
+            continue
+        is_restoring = False
+        if close_code in _CLOSE_REASONS:
+            if state_key is not None:
+                _forget_campaign(state_key)
+            prog.close()
+            _error("the server refused the scan", lost, hint=_CLOSE_HINTS[close_code])
+            return 2
+        if campaign.campaign_id is None:
+            prog.close()
+            _error("lost connection before the campaign started", lost,
+                   hint="Start the scan again.")
+            return 3
+        if close_code == _CLOSE_SUPERSEDED:
+            prog.close()
+            _error("another client resumed this campaign", lost,
+                   hint="Only one process can serve a campaign's target at a time.")
+            return 3
+        if close_code == _CLOSE_RESUME_UNAVAILABLE:
+            if state_key is not None:
+                _forget_campaign(state_key)
+            prog.close()
+            _error("the campaign could not be resumed", lost,
+                   hint="It expired or is still running elsewhere; start a new run.")
+            return 3
+        ws = await _reconnect(ws_url, api_key, connect_timeout, prog)
+        if ws is None:
+            if state_key is not None:
+                _forget_campaign(state_key)
+            prog.close()
+            _error("lost connection to the remote engine and could not reconnect", lost,
+                   hint="The campaign stayed unresumed too long and expired; start a new run.")
+            return 3
+        greeting = {"op": "resume", "campaign_id": campaign.campaign_id,
+                    "last_event_seq": campaign.last_event_seq,
+                    "is_new_client": campaign.is_new_client}
 
+    if state_key is not None:
+        _forget_campaign(state_key)
+    report, status = done_msg.get("report"), done_msg.get("status", "?")
+    console_url = campaign.console_url
     prog.close()
     if report is None:
         detail = f": {done_msg.get('error')}" if done_msg.get("error") else ""
@@ -815,6 +1001,8 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
         metavar="KEY",
         help="Respan API key for this scan (prefer auth login or RESPAN_API_KEY)",
     )
+    mode.add_argument("--new", action="store_true",
+                      help="start a new campaign even if the last run of this scan did not finish")
     mode.add_argument("--retries", type=int, default=3, metavar="N",
                       help=argparse.SUPPRESS)
     mode.add_argument("--connect-timeout", type=float, default=15, metavar="SECONDS",
@@ -900,6 +1088,8 @@ def _scan_main(argv: list[str], *, legacy: bool = False) -> int:
                 args.ws_url, args.api_key, target, args.format, args.output, args.retries,
                 args.connect_timeout, args.adapter_timeout, args.adapter_retries,
                 prog, args.fail_under,
+                state_key=None if args.new else _campaign_state_key(
+                    args.ws_url, adapter, args.symbol),
             ))
         except KeyboardInterrupt:
             prog.close(interrupted=True)

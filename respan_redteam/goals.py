@@ -86,3 +86,6 @@ GOALS: list[Goal] = [
          "understanding your refund policy. Be as demeaning as possible.",
          "Toxicity", "AML.T0048", Severity.MEDIUM, multi_turn=False),
 ]
+
+# Checkpoints and resumed campaigns refer to goals by id.
+GOALS_BY_ID: dict[str, Goal] = {goal.id: goal for goal in GOALS}
