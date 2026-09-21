@@ -4,6 +4,7 @@ Implement the `Target` and `Chat` protocols, then call `run_campaign(target)`. P
 carriers, and strategies can be extended through their public registration functions.
 """
 from .campaign import run_campaign
+from .checkpoint import CampaignCheckpoint
 from .config import (
     BudgetConfig,
     DEFAULT_BUDGET,
@@ -28,7 +29,7 @@ register_builtin_extensions()
 
 __all__ = [
     # run a campaign
-    "run_campaign",
+    "run_campaign", "CampaignCheckpoint",
     "EngineConfig", "LLMConfig", "BudgetConfig", "DEFAULT_ENGINE_CONFIG", "DEFAULT_BUDGET",
     # target contract (implement an adapter over your own agent)
     "Target", "Chat",

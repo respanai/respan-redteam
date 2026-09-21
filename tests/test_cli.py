@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import os
 import tempfile
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import AsyncMock, patch
 
@@ -486,6 +488,20 @@ def test_scan_accepts_server_origin_and_runs_remote_adapter():
     assert remote.await_args.args[0] == "ws://localhost:8000/redteam/remote/"
 
 
+def test_scan_resumes_by_default_and_new_starts_fresh():
+    target = type("Target", (), {"label": "test-agent"})()
+    for extra_args, is_resume_expected in (([], True), (["--new"], False)):
+        remote = AsyncMock(return_value=0)
+        with patch("respan_redteam.cli._load_adapter", return_value=target), \
+             patch("respan_redteam.cli.resolve_api_key", return_value=("secret", "test")), \
+             patch("respan_redteam.cli._run_remote", new=remote):
+            assert _scan_main([
+                "adapter.py", "--server", "http://localhost:8000", "--quiet", *extra_args
+            ]) == 0
+        state_key = remote.await_args.kwargs["state_key"]
+        assert (state_key is not None) == is_resume_expected, extra_args
+
+
 def test_scan_without_credentials_points_to_auth_login():
     output = io.StringIO()
     with patch("respan_redteam.cli.resolve_api_key", return_value=(None, "none")), \
@@ -596,6 +612,221 @@ def test_remote_scan_reports_refusal_instead_of_raw_close():
         assert "enable red teaming" in stderr.getvalue()
 
     asyncio.run(run())
+
+
+
+# --- resume after a dropped socket (DEV-11845) -------------------------------------------
+
+class _FakeSocket:
+    """Scripted server side of one WebSocket: yields `frames`, then ends or raises `end`."""
+
+    def __init__(self, frames, *, end=None, close_code=None):
+        self._frames = [json.dumps(frame) for frame in frames]
+        self._end = end
+        self.close_code = close_code
+        self.sent: list[dict] = []
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+    async def close(self):
+        pass
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for frame in self._frames:
+            yield frame
+        if self._end is not None:
+            raise self._end
+
+
+class _CountingTarget:
+    label = "agent"
+
+    def __init__(self):
+        self.messages: list[str] = []
+
+    def open(self):
+        target = self
+
+        class _Chat:
+            def send(self, message):
+                target.messages.append(message)
+                return f"reply {len(target.messages)}"
+
+            def transcript(self):
+                return []
+
+        return _Chat()
+
+
+def _dropped():
+    from websockets.exceptions import ConnectionClosedError
+    return ConnectionClosedError(None, None)
+
+
+def _run_remote_with(sockets, target=None, output=None, prog=None, state_key=None):
+    from respan_redteam.cli import _run_remote
+
+    connect = AsyncMock(side_effect=sockets)
+    stderr = io.StringIO()
+
+    async def run():
+        with patch("respan_redteam.cli._connect", new=connect), redirect_stderr(stderr):
+            return await _run_remote(DEFAULT_URL, "secret", target or _CountingTarget(), "json",
+                                     output, 1, 1.0, 5.0, 1, prog or _Progress(quiet=True),
+                                     state_key=state_key)
+
+    return asyncio.run(run()), stderr.getvalue(), connect
+
+
+def test_remote_scan_resumes_after_a_drop_without_rerunning_the_inflight_turn():
+    target = _CountingTarget()
+    first = _FakeSocket([
+        {"op": "ready", "campaign_id": "cmp-1"},
+        {"op": "event", "name": "session.start", "data": {"target": "agent"}, "seq": 1},
+        {"op": "open", "id": "1", "chat_id": "c1"},
+        {"op": "send", "id": "2", "chat_id": "c1", "message": "first probe"},
+        {"op": "event", "name": "target.response", "data": {}, "seq": 2},
+    ], end=_dropped())
+    resumed = _FakeSocket([
+        {"op": "resumed", "campaign_id": "cmp-1"},
+        {"op": "event", "name": "target.response", "data": {}, "seq": 2},  # replayed twice
+        {"op": "send", "id": "2", "chat_id": "c1", "message": "first probe"},  # re-sent turn
+        {"op": "send", "id": "3", "chat_id": "c1", "message": "second probe"},
+        {"op": "done", "status": "succeeded", "report": {"grade": "B"}},
+    ])
+    prog = _Progress(quiet=True)
+    shown: list[str] = []
+    prog.sink = lambda event, data: shown.append(event)
+    with tempfile.TemporaryDirectory() as tmp:
+        report_path = os.path.join(tmp, "report.json")
+        code, stderr, connect = _run_remote_with([first, resumed], target, report_path, prog)
+        assert Path(report_path).read_text().strip().startswith("{")
+
+    assert code == 0, stderr
+    assert connect.await_count == 2
+    assert resumed.sent[0] == {"op": "resume", "campaign_id": "cmp-1", "last_event_seq": 2,
+                               "is_new_client": False}
+    # The adapter ran "first probe" once; the re-sent turn got the cached answer.
+    assert target.messages == ["first probe", "second probe"]
+    first_answer = next(frame for frame in first.sent if frame.get("id") == "2")
+    resent_answer = next(frame for frame in resumed.sent if frame.get("id") == "2")
+    assert resent_answer == first_answer
+    assert shown == ["session.start", "target.response"]
+
+
+def test_remote_scan_stops_when_the_campaign_cannot_be_resumed():
+    first = _FakeSocket([{"op": "ready", "campaign_id": "cmp-1"}], end=_dropped())
+    refused = _FakeSocket([{"op": "error", "error": "campaign cannot be resumed"}],
+                          end=_server_close(4410))
+
+    code, stderr, _connect = _run_remote_with([first, refused])
+
+    assert code == 3
+    assert "could not be resumed" in stderr
+
+
+def test_remote_scan_stops_when_the_reconnect_window_runs_out():
+    first = _FakeSocket([{"op": "ready", "campaign_id": "cmp-1"}], end=_dropped())
+    with patch("respan_redteam.cli._RESUME_WINDOW_SECONDS", 0.05):
+        code, stderr, connect = _run_remote_with([first] + [OSError("network down")] * 20)
+
+    assert code == 3
+    assert "could not reconnect" in stderr
+    assert connect.await_count >= 2
+
+
+def test_remote_scan_does_not_resume_before_the_campaign_started():
+    first = _FakeSocket([], end=_dropped())
+
+    code, stderr, connect = _run_remote_with([first])
+
+    assert code == 3
+    assert "before the campaign started" in stderr
+    assert connect.await_count == 1
+
+
+def test_remote_scan_explains_a_refusal_sent_as_error_frame_then_close():
+    refused = _FakeSocket([{"op": "error", "error": "campaign rate limit exceeded"}],
+                          end=_server_close(4429))
+
+    code, stderr, _connect = _run_remote_with([refused])
+
+    assert code == 2
+    assert "refused the scan" in stderr
+
+
+def _with_state_file(test):
+    """Run ``test`` with the CLI's campaign state kept in a throwaway config dir."""
+    def run():
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"RESPAN_REDTEAM_CONFIG": os.path.join(tmp, "config.toml")}
+        ):
+            test()
+    run.__name__ = test.__name__
+    return run
+
+
+@_with_state_file
+def test_rerun_after_a_crash_resumes_the_unfinished_campaign():
+    from respan_redteam.cli import _saved_campaign_id
+
+    crashed = _FakeSocket([
+        {"op": "ready", "campaign_id": "cmp-1"},
+        {"op": "open", "id": "1.1", "chat_id": "1.c1"},
+    ], end=KeyboardInterrupt())
+    try:
+        _run_remote_with([crashed], state_key="scan")
+    except KeyboardInterrupt:
+        pass
+    assert _saved_campaign_id("scan") == "cmp-1"
+
+    target = _CountingTarget()
+    restored = _FakeSocket([
+        {"op": "resumed", "campaign_id": "cmp-1"},
+        {"op": "open", "id": "3.1", "chat_id": "3.c1"},
+        {"op": "send", "id": "3.2", "chat_id": "3.c1", "message": "second probe"},
+        {"op": "done", "status": "succeeded", "report": {"grade": "B"}},
+    ])
+    code, stderr, _connect = _run_remote_with([restored], target, state_key="scan")
+
+    assert code == 0, stderr
+    # A fresh process has none of the old chats, so it asks the server to rewind.
+    assert restored.sent[0] == {"op": "resume", "campaign_id": "cmp-1",
+                                "last_event_seq": 0, "is_new_client": True}
+    assert target.messages == ["second probe"]
+    assert _saved_campaign_id("scan") is None
+
+
+@_with_state_file
+def test_rerun_starts_a_new_campaign_when_the_old_one_cannot_be_resumed():
+    from respan_redteam.cli import _remember_campaign, _saved_campaign_id
+
+    _remember_campaign("scan", "cmp-old")
+    refused = _FakeSocket([{"op": "error", "error": "campaign cannot be resumed"}],
+                          end=_server_close(4410))
+    fresh = _FakeSocket([
+        {"op": "ready", "campaign_id": "cmp-new"},
+        {"op": "done", "status": "succeeded", "report": {"grade": "A"}},
+    ])
+
+    code, stderr, _connect = _run_remote_with([refused, fresh], state_key="scan")
+
+    assert code == 0, stderr
+    assert fresh.sent[0]["op"] == "hello"
+    assert _saved_campaign_id("scan") is None
+
+
+@_with_state_file
+def test_saved_campaign_older_than_the_resume_window_is_ignored():
+    from respan_redteam.cli import _remember_campaign, _saved_campaign_id
+
+    _remember_campaign("scan", "cmp-old")
+    with patch("respan_redteam.cli.time.time", return_value=time.time() + 31 * 60):
+        assert _saved_campaign_id("scan") is None
 
 
 def main():

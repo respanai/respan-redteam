@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 
+from .checkpoint import CampaignCheckpoint, CheckpointSink
 from .execution.agentic import CanaryCollector
 from .config import DEFAULT_ENGINE_CONFIG, BudgetConfig, EngineConfig
 from .runtime import (Usage, budget_can_send, budget_remaining, campaign_scope,
@@ -12,7 +13,7 @@ from .runtime import (Usage, budget_can_send, budget_remaining, campaign_scope,
 from .events import (RECON_PHASE, CategoryStart, FindingDetected, ReportReady, SessionStart,
                      StrategyError, StrategyStart)
 from .judge import judge as judge_response
-from .goals import GOALS, Goal
+from .goals import GOALS, GOALS_BY_ID, Goal
 from .recon import run_recon, _maybe_decode_b64
 from .report import GATEWAY_ONLY_INFO
 from .strategies import (StrategyInput, StrategyStage, applicable_strategies)
@@ -60,36 +61,53 @@ def _recon_disclosure_findings(profile, recon_probes) -> list[Finding]:
     return findings
 
 
+_STAGES = (StrategyStage.AGENTIC, StrategyStage.BREADTH, StrategyStage.DEPTH)
+
+
 def run_campaign(
     target: Target,
     config: EngineConfig | BudgetConfig = DEFAULT_ENGINE_CONFIG,
     sink: EventSink = null_sink,
+    *,
+    resume_from: CampaignCheckpoint | None = None,
+    on_checkpoint: CheckpointSink | None = None,
 ) -> CampaignResult:
+    """Run a campaign, or continue one from `resume_from`. `on_checkpoint` receives a
+    checkpoint at every goal boundary and must persist it before returning."""
     label = getattr(target, "label", "target")
     if isinstance(config, BudgetConfig):
         config = EngineConfig(budget=config)
     with campaign_scope(config, target, sink):
-        return _run_campaign(label, config.budget)
+        return _run_campaign(label, config.budget, resume_from=resume_from,
+                             on_checkpoint=on_checkpoint)
 
 
-def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
-    emit(SessionStart(target=label))
-
-    # --- recon --- (budget/usage/events are all ambient now; probes go through open_chat())
-    profile, recon_probes = run_recon(recon_probes=cfg.recon_probes)
+def _run_campaign(label: str, cfg: BudgetConfig, *, resume_from: CampaignCheckpoint | None,
+                  on_checkpoint: CheckpointSink | None) -> CampaignResult:
+    if resume_from is None:
+        emit(SessionStart(target=label))
+        # --- recon --- (budget/usage/events are all ambient now; probes go through open_chat())
+        profile, recon_probes = run_recon(recon_probes=cfg.recon_probes)
+    else:
+        profile, recon_probes = resume_from.profile, resume_from.recon_probes
+        resume_from.restore_runtime()
     set_profile(profile)                              # make recon profile ambient for strategies
 
     result = CampaignResult(target_label=label, profile=profile)
     result.all_probes.extend(recon_probes)
-    per_goal: dict[str, list[Probe]] = {}
-    findings_by_cat: dict[str, list[Finding]] = {}
-
-    # --- harvest recon disclosure into findings ---
-    # Recon is often our strongest extraction vector; judge the aggregate so distributed/side-channel leakage counts.
-    recon_solved_categories: set[str] = set()
-    for f in _recon_disclosure_findings(profile, recon_probes):
-        findings_by_cat.setdefault(f.category, []).append(f)
-        recon_solved_categories.add(f.category)
+    if resume_from is None:
+        per_goal: dict[str, list[Probe]] = {}
+        findings_by_cat: dict[str, list[Finding]] = {}
+        # --- harvest recon disclosure into findings ---
+        # Recon is often our strongest extraction vector; judge the aggregate so distributed/side-channel leakage counts.
+        recon_solved_categories: set[str] = set()
+        for f in _recon_disclosure_findings(profile, recon_probes):
+            findings_by_cat.setdefault(f.category, []).append(f)
+            recon_solved_categories.add(f.category)
+    else:
+        per_goal = resume_from.per_goal
+        findings_by_cat = resume_from.findings_by_cat
+        recon_solved_categories = resume_from.recon_solved_categories
 
     def record(goal: Goal, probes: list[Probe], *, phase: str, strategy: str | None) -> bool:
         per_goal.setdefault(goal.id, []).extend(probes)
@@ -113,11 +131,35 @@ def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
             return None
 
     scope = [g for g in GOALS if _in_scope(g, profile)]
-    solved: set[str] = set()
-    # Recon can solve the direct disclosure goals, but not other goals sharing their OWASP category.
-    for g in scope:
-        if not g.key and g.category in recon_solved_categories:
-            solved.add(g.id)
+    if resume_from is None:
+        solved: set[str] = set()
+        # Recon can solve the direct disclosure goals, but not other goals sharing their OWASP category.
+        for g in scope:
+            if not g.key and g.category in recon_solved_categories:
+                solved.add(g.id)
+    else:
+        solved = resume_from.solved
+
+    def checkpoint(stage_index: int, stage_goals: list[Goal], next_goal_index: int) -> None:
+        if on_checkpoint is None:
+            return
+        budget, usage = current_budget(), current_usage()
+        on_checkpoint(CampaignCheckpoint(
+            profile=profile,
+            recon_probes=list(recon_probes),
+            recon_solved_categories=set(recon_solved_categories),
+            findings_by_cat={cat: list(found) for cat, found in findings_by_cat.items()},
+            per_goal={goal_id: list(probes) for goal_id, probes in per_goal.items()},
+            solved=set(solved),
+            stage_index=stage_index,
+            stage_goal_ids=[goal.id for goal in stage_goals],
+            next_goal_index=next_goal_index,
+            budget_sent=budget.sent,
+            budget_completed=budget.completed,
+            budget_errored=budget.errored,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+        ))
 
     # Agentic strategies share one campaign-scoped canary collector. The scheduler treats them like
     # every other post-recon strategy; the try/finally only owns the collector's socket lifecycle.
@@ -186,23 +228,35 @@ def _run_campaign(label: str, cfg: BudgetConfig) -> CampaignResult:
                 return [future.result() for future in futures]
 
         # Every post-recon target interaction is a staged Strategy with one input and return shape.
-        for stage in (StrategyStage.AGENTIC, StrategyStage.BREADTH, StrategyStage.DEPTH):
-            goals = sorted(
-                (goal for goal in scope if goal.id not in solved),
-                key=lambda goal: SEVERITY_RANK[goal.base_severity], reverse=True,
-            )
-            goals = [g for g in goals if stage is StrategyStage.AGENTIC or not g.agentic_only]
+        first_stage_index = resume_from.stage_index if resume_from is not None else 0
+        for stage_index in range(first_stage_index, len(_STAGES)):
+            stage = _STAGES[stage_index]
+            if resume_from is not None and stage_index == resume_from.stage_index:
+                # The stage's goal list was fixed when it started; recomputing it from the
+                # grown `solved` set would shift every index after the resume point.
+                goals = [GOALS_BY_ID[goal_id] for goal_id in resume_from.stage_goal_ids
+                         if goal_id in GOALS_BY_ID]
+                first_goal_index = resume_from.next_goal_index
+            else:
+                goals = sorted(
+                    (goal for goal in scope if goal.id not in solved),
+                    key=lambda goal: SEVERITY_RANK[goal.base_severity], reverse=True,
+                )
+                goals = [g for g in goals if stage is StrategyStage.AGENTIC or not g.agentic_only]
+                first_goal_index = 0
             # Severity order is preserved ACROSS waves, so the worst goals still
             # claim the shared budget first; only goals of comparable severity
             # inside one window compete for it.
             width = max(1, cfg.goal_concurrency)
-            for start in range(0, len(goals), width):
+            checkpoint(stage_index, goals, first_goal_index)
+            for start in range(first_goal_index, len(goals), width):
                 if not budget_can_send():
                     break
                 wave = goals[start:start + width]
                 for goal, (probes, strategy) in zip(wave, _advance_wave(wave, stage)):
                     if record(goal, probes, phase=stage.value, strategy=strategy):
                         solved.add(goal.id)
+                checkpoint(stage_index, goals, start + width)
     finally:
         if canary:
             canary.close()
